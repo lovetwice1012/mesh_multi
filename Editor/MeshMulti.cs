@@ -82,6 +82,7 @@ public static class MeshMulti
     private static void ThinPlateSmooth(Mesh mesh, int iterations = 10, float lambda = 0.1f, int meshIndex = 0, int meshTotal = 1)
     {
         var vertices = mesh.vertices;
+        var originalVertices = (Vector3[])vertices.Clone();
         var triangles = mesh.triangles;
         var adjacency = new HashSet<int>[vertices.Length];
         for (int i = 0; i < adjacency.Length; i++)
@@ -160,6 +161,16 @@ public static class MeshMulti
                 foreach (var idx in group) avg += vertices[idx];
                 avg /= group.Count;
                 foreach (var idx in group) vertices[idx] = avg;
+            }
+        }
+
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            var v = vertices[i];
+            if (float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z) ||
+                float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z))
+            {
+                vertices[i] = originalVertices[i];
             }
         }
 
