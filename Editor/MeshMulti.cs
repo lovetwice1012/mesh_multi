@@ -96,6 +96,36 @@ public static class MeshMulti
             adjacency[c].Add(a); adjacency[c].Add(b);
         }
 
+        // Group vertices by position to account for duplicated vertices
+        // along seams. Without this, smoothing each copy independently
+        // can introduce visible gaps.
+        var positionGroups = new Dictionary<Vector3, List<int>>();
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            List<int> list;
+            if (!positionGroups.TryGetValue(vertices[i], out list))
+            {
+                list = new List<int>();
+                positionGroups.Add(vertices[i], list);
+            }
+            list.Add(i);
+        }
+        foreach (var group in positionGroups.Values)
+        {
+            if (group.Count < 2) continue;
+            var merged = new HashSet<int>();
+            foreach (var idx in group)
+                merged.UnionWith(adjacency[idx]);
+            foreach (var idx in group)
+                foreach (var idx2 in group)
+                    if (idx != idx2) merged.Add(idx2);
+            foreach (var idx in group)
+            {
+                adjacency[idx] = new HashSet<int>(merged);
+                adjacency[idx].Remove(idx);
+            }
+        }
+
         var lap = new Vector3[vertices.Length];
         var lap2 = new Vector3[vertices.Length];
         for (int it = 0; it < iterations; it++)
@@ -121,6 +151,16 @@ public static class MeshMulti
             }
             for (int i = 0; i < vertices.Length; i++)
                 vertices[i] += lambda * lap2[i];
+
+            // Keep duplicate-position vertices welded together
+            foreach (var group in positionGroups.Values)
+            {
+                if (group.Count < 2) continue;
+                Vector3 avg = Vector3.zero;
+                foreach (var idx in group) avg += vertices[idx];
+                avg /= group.Count;
+                foreach (var idx in group) vertices[idx] = avg;
+            }
         }
 
         mesh.vertices = vertices;
