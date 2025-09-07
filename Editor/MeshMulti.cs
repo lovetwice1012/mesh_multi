@@ -28,7 +28,7 @@ public static class MeshMulti
 
             var newMesh = SubdivideMesh(originalMesh);
             if (smooth)
-                ThinPlateSmooth(newMesh, smoothIterations, i, total);
+                ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total);
 
             float percent = ((float)(i + 1) / total) * 100f;
             percent = Mathf.Floor(percent * 1000f) / 1000f;
