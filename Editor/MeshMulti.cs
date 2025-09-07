@@ -163,6 +163,18 @@ public static class MeshMulti
             }
         }
 
+        // Sanitize the smoothed vertices to avoid invalid values that can crash Unity.
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            var v = vertices[i];
+            if (float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z) ||
+                float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z))
+            {
+                v = Vector3.zero;
+                vertices[i] = v;
+            }
+        }
+
         mesh.vertices = vertices;
         mesh.RecalculateBounds();
         mesh.RecalculateNormals();
