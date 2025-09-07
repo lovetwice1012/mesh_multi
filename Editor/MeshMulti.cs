@@ -1,15 +1,14 @@
 using System.Collections.Generic;
 using System.Linq;
+using System.IO;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
 
 public static class MeshMulti
 {
-    [MenuItem("Tools/Subdivide Skinned Meshes")]
-    private static void SubdivideSelected()
+    public static void SubdivideSelected(GameObject selected)
     {
-        var selected = Selection.activeGameObject;
         if (selected == null)
         {
             Debug.LogWarning("No GameObject selected.");
@@ -19,12 +18,52 @@ public static class MeshMulti
         var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
         foreach (var renderer in renderers)
         {
-            if (renderer.sharedMesh == null) continue;
-            var newMesh = SubdivideMesh(renderer.sharedMesh);
-            renderer.sharedMesh = newMesh;
+            var originalMesh = renderer.sharedMesh;
+            if (originalMesh == null) continue;
+
+            var newMesh = SubdivideMesh(originalMesh);
+            newMesh.name = originalMesh.name + "_subdivided";
+
+            var meshPath = AssetDatabase.GetAssetPath(originalMesh);
+            if (!string.IsNullOrEmpty(meshPath))
+            {
+                var directory = Path.GetDirectoryName(meshPath);
+                var name = Path.GetFileNameWithoutExtension(meshPath) + "_subdivided.asset";
+                var newPath = AssetDatabase.GenerateUniqueAssetPath(Path.Combine(directory, name));
+                AssetDatabase.CreateAsset(newMesh, newPath);
+                AssetDatabase.SaveAssets();
+                renderer.sharedMesh = AssetDatabase.LoadAssetAtPath<Mesh>(newPath);
+            }
+            else
+            {
+                renderer.sharedMesh = newMesh;
+            }
+
+            EditorUtility.SetDirty(renderer);
         }
 
         Debug.Log(string.Format("Subdivided {0} meshes under '{1}'.", renderers.Length, selected.name));
+    }
+
+    public static int PredictSubdividedVertexCount(Mesh mesh)
+    {
+        int[] triangles = mesh.triangles;
+        var edges = new HashSet<Edge>();
+        for (int i = 0; i < triangles.Length; i += 3)
+        {
+            int v0 = triangles[i];
+            int v1 = triangles[i + 1];
+            int v2 = triangles[i + 2];
+            edges.Add(new Edge(v0, v1));
+            edges.Add(new Edge(v1, v2));
+            edges.Add(new Edge(v2, v0));
+        }
+        return mesh.vertexCount + edges.Count;
+    }
+
+    public static int PredictSubdividedTriangleCount(Mesh mesh)
+    {
+        return mesh.triangles.Length / 3 * 4;
     }
 
     private struct Edge : System.IEquatable<Edge>
@@ -296,5 +335,46 @@ public static class MeshMulti
             dict[boneIndex] = existing + weight;
         else
             dict[boneIndex] = weight;
+    }
+}
+
+public class MeshMultiWindow : EditorWindow
+{
+    [MenuItem("yussy/Subdivide Skinned Meshes")]
+    private static void ShowWindow()
+    {
+        GetWindow<MeshMultiWindow>("Subdivide Meshes");
+    }
+
+    private void OnGUI()
+    {
+        var selected = Selection.activeGameObject;
+        if (selected == null)
+        {
+            EditorGUILayout.HelpBox("No GameObject selected.", MessageType.Info);
+            return;
+        }
+
+        var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
+        foreach (var renderer in renderers)
+        {
+            var mesh = renderer.sharedMesh;
+            if (mesh == null) continue;
+            int predictedVertices = MeshMulti.PredictSubdividedVertexCount(mesh);
+            int predictedTriangles = MeshMulti.PredictSubdividedTriangleCount(mesh);
+            EditorGUILayout.LabelField(
+                mesh.name,
+                string.Format(
+                    "Vertices: {0} → {1}, Triangles: {2} → {3}",
+                    mesh.vertexCount,
+                    predictedVertices,
+                    mesh.triangles.Length / 3,
+                    predictedTriangles));
+        }
+
+        if (GUILayout.Button("Subdivide"))
+        {
+            MeshMulti.SubdivideSelected(selected);
+        }
     }
 }
