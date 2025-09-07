@@ -150,8 +150,10 @@ public static class MeshMulti
                 foreach (var n in adjacency[i]) sum += lap[n];
                 lap2[i] = sum / adjacency[i].Count - lap[i];
             }
+            // Subtracting moves vertices toward lower curvature. Using addition here
+            // would amplify curvature and can explode the mesh during smoothing.
             for (int i = 0; i < vertices.Length; i++)
-                vertices[i] += lambda * lap2[i];
+                vertices[i] -= lambda * lap2[i];
 
             // Keep duplicate-position vertices welded together
             foreach (var group in positionGroups.Values)
