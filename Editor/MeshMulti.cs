@@ -84,6 +84,7 @@ public static class MeshMulti
         var vertices = mesh.vertices;
         var originalVertices = (Vector3[])vertices.Clone();
         var triangles = mesh.triangles;
+        var boneWeights = mesh.boneWeights;
         var adjacency = new HashSet<int>[vertices.Length];
         for (int i = 0; i < adjacency.Length; i++)
             adjacency[i] = new HashSet<int>();
@@ -166,6 +167,19 @@ public static class MeshMulti
             }
         }
 
+        // Ensure vertices sharing a position also share averaged bone weights
+        if (boneWeights.Length > 0)
+        {
+            foreach (var group in positionGroups.Values)
+            {
+                if (group.Count < 2) continue;
+                var weights = new List<BoneWeight>(group.Count);
+                foreach (var idx in group) weights.Add(boneWeights[idx]);
+                var avgWeight = AverageBoneWeights(weights);
+                foreach (var idx in group) boneWeights[idx] = avgWeight;
+            }
+        }
+
         for (int i = 0; i < vertices.Length; i++)
         {
             var v = vertices[i];
@@ -177,6 +191,7 @@ public static class MeshMulti
         }
 
         mesh.vertices = vertices;
+        if (boneWeights.Length > 0) mesh.boneWeights = boneWeights;
         mesh.RecalculateBounds();
         mesh.RecalculateNormals();
         mesh.RecalculateTangents();
@@ -407,6 +422,61 @@ public static class MeshMulti
             dict[keys[i]] *= 0.5f;
 
         var ordered = dict.OrderByDescending(delegate (KeyValuePair<int, float> kv) { return kv.Value; }).Take(4).ToArray();
+        BoneWeight result = new BoneWeight();
+        for (int i = 0; i < ordered.Length; i++)
+        {
+            switch (i)
+            {
+                case 0:
+                    result.boneIndex0 = ordered[i].Key;
+                    result.weight0 = ordered[i].Value;
+                    break;
+                case 1:
+                    result.boneIndex1 = ordered[i].Key;
+                    result.weight1 = ordered[i].Value;
+                    break;
+                case 2:
+                    result.boneIndex2 = ordered[i].Key;
+                    result.weight2 = ordered[i].Value;
+                    break;
+                case 3:
+                    result.boneIndex3 = ordered[i].Key;
+                    result.weight3 = ordered[i].Value;
+                    break;
+            }
+        }
+
+        float total = result.weight0 + result.weight1 + result.weight2 + result.weight3;
+        if (total > 0f)
+        {
+            result.weight0 /= total;
+            result.weight1 /= total;
+            result.weight2 /= total;
+            result.weight3 /= total;
+        }
+
+        return result;
+    }
+
+    private static BoneWeight AverageBoneWeights(IList<BoneWeight> weights)
+    {
+        Dictionary<int, float> dict = new Dictionary<int, float>();
+        int count = 0;
+        foreach (var w in weights)
+        {
+            count++;
+            AddBone(ref dict, w.boneIndex0, w.weight0);
+            AddBone(ref dict, w.boneIndex1, w.weight1);
+            AddBone(ref dict, w.boneIndex2, w.weight2);
+            AddBone(ref dict, w.boneIndex3, w.weight3);
+        }
+        if (count == 0) return new BoneWeight();
+
+        List<int> keys = new List<int>(dict.Keys);
+        for (int i = 0; i < keys.Count; i++)
+            dict[keys[i]] /= count;
+
+        var ordered = dict.OrderByDescending(kv => kv.Value).Take(4).ToArray();
         BoneWeight result = new BoneWeight();
         for (int i = 0; i < ordered.Length; i++)
         {
