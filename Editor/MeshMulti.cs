@@ -98,10 +98,10 @@ public static class MeshMulti
             adjacency[c].Add(a); adjacency[c].Add(b);
         }
 
-        // Group vertices by position to account for duplicated vertices
-        // along seams. Without this, smoothing each copy independently
-        // can introduce visible gaps.
-        var positionGroups = new Dictionary<Vector3, List<int>>();
+        // Group vertices by position (with a small tolerance) to account for
+        // duplicated vertices along seams. Without this, smoothing each copy
+        // independently can introduce visible gaps.
+        var positionGroups = new Dictionary<Vector3, List<int>>(new Vector3EqualityComparer(1e-6f));
         for (int i = 0; i < vertices.Length; i++)
         {
             List<int> list;
@@ -195,6 +195,29 @@ public static class MeshMulti
         mesh.RecalculateBounds();
         mesh.RecalculateNormals();
         mesh.RecalculateTangents();
+    }
+
+    private class Vector3EqualityComparer : IEqualityComparer<Vector3>
+    {
+        private readonly float tolerance;
+        public Vector3EqualityComparer(float tolerance) { this.tolerance = tolerance; }
+        public bool Equals(Vector3 a, Vector3 b)
+        {
+            return Mathf.Abs(a.x - b.x) <= tolerance &&
+                   Mathf.Abs(a.y - b.y) <= tolerance &&
+                   Mathf.Abs(a.z - b.z) <= tolerance;
+        }
+        public int GetHashCode(Vector3 v)
+        {
+            int hx = Mathf.RoundToInt(v.x / tolerance);
+            int hy = Mathf.RoundToInt(v.y / tolerance);
+            int hz = Mathf.RoundToInt(v.z / tolerance);
+            int hash = 17;
+            hash = hash * 31 + hx;
+            hash = hash * 31 + hy;
+            hash = hash * 31 + hz;
+            return hash;
+        }
     }
 
     private struct Edge : System.IEquatable<Edge>
