@@ -7,7 +7,7 @@ using UnityEngine.Rendering;
 
 public static class MeshMulti
 {
-    public static void SubdivideSelected(GameObject selected)
+    public static void SubdivideSelected(GameObject selected, bool smooth, int smoothIterations = 10)
     {
         if (selected == null)
         {
@@ -16,12 +16,23 @@ public static class MeshMulti
         }
 
         var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
-        foreach (var renderer in renderers)
+        int total = renderers.Length;
+        for (int i = 0; i < total; i++)
         {
+            var renderer = renderers[i];
+            EditorUtility.DisplayProgressBar("Subdivide Meshes", $"Processing {i + 1}/{total}: {renderer.name}", (float)i / total);
+
             var originalMesh = renderer.sharedMesh;
-            if (originalMesh == null) continue;
+            if (originalMesh == null)
+                continue;
 
             var newMesh = SubdivideMesh(originalMesh);
+            if (smooth)
+                ThinPlateSmooth(newMesh, smoothIterations, i, total);
+
+            float percent = ((float)(i + 1) / total) * 100f;
+            percent = Mathf.Floor(percent * 1000f) / 1000f;
+            EditorUtility.DisplayProgressBar("Subdivide Meshes", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
             newMesh.name = originalMesh.name + "_subdivided";
 
             var meshPath = AssetDatabase.GetAssetPath(originalMesh);
@@ -41,8 +52,10 @@ public static class MeshMulti
 
             EditorUtility.SetDirty(renderer);
         }
+        EditorUtility.ClearProgressBar();
 
-        Debug.Log(string.Format("Subdivided {0} meshes under '{1}'.", renderers.Length, selected.name));
+        float finalPercent = Mathf.Floor(100f * 1000f) / 1000f;
+        Debug.Log(string.Format("Subdivided {0} meshes under '{1}' ({2:F3}%).", renderers.Length, selected.name, finalPercent));
     }
 
     public static int PredictSubdividedVertexCount(Mesh mesh)
@@ -64,6 +77,56 @@ public static class MeshMulti
     public static int PredictSubdividedTriangleCount(Mesh mesh)
     {
         return mesh.triangles.Length / 3 * 4;
+    }
+
+    private static void ThinPlateSmooth(Mesh mesh, int iterations = 10, float lambda = 0.1f, int meshIndex = 0, int meshTotal = 1)
+    {
+        var vertices = mesh.vertices;
+        var triangles = mesh.triangles;
+        var adjacency = new HashSet<int>[vertices.Length];
+        for (int i = 0; i < adjacency.Length; i++)
+            adjacency[i] = new HashSet<int>();
+        for (int i = 0; i < triangles.Length; i += 3)
+        {
+            int a = triangles[i];
+            int b = triangles[i + 1];
+            int c = triangles[i + 2];
+            adjacency[a].Add(b); adjacency[a].Add(c);
+            adjacency[b].Add(a); adjacency[b].Add(c);
+            adjacency[c].Add(a); adjacency[c].Add(b);
+        }
+
+        var lap = new Vector3[vertices.Length];
+        var lap2 = new Vector3[vertices.Length];
+        for (int it = 0; it < iterations; it++)
+        {
+            EditorUtility.DisplayProgressBar(
+                "Subdivide Meshes",
+                $"Smoothing mesh {meshIndex + 1}/{meshTotal}, iteration {it + 1}/{iterations}",
+                (meshIndex + (float)(it + 1) / iterations) / meshTotal);
+
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                if (adjacency[i].Count == 0) { lap[i] = Vector3.zero; continue; }
+                Vector3 sum = Vector3.zero;
+                foreach (var n in adjacency[i]) sum += vertices[n];
+                lap[i] = sum / adjacency[i].Count - vertices[i];
+            }
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                if (adjacency[i].Count == 0) { lap2[i] = Vector3.zero; continue; }
+                Vector3 sum = Vector3.zero;
+                foreach (var n in adjacency[i]) sum += lap[n];
+                lap2[i] = sum / adjacency[i].Count - lap[i];
+            }
+            for (int i = 0; i < vertices.Length; i++)
+                vertices[i] += lambda * lap2[i];
+        }
+
+        mesh.vertices = vertices;
+        mesh.RecalculateBounds();
+        mesh.RecalculateNormals();
+        mesh.RecalculateTangents();
     }
 
     private struct Edge : System.IEquatable<Edge>
@@ -340,6 +403,9 @@ public static class MeshMulti
 
 public class MeshMultiWindow : EditorWindow
 {
+    private bool smoothAppearance;
+    private int smoothIterations = 10;
+
     [MenuItem("yussy/Subdivide Skinned Meshes")]
     private static void ShowWindow()
     {
@@ -372,9 +438,13 @@ public class MeshMultiWindow : EditorWindow
                     predictedTriangles));
         }
 
+        smoothAppearance = EditorGUILayout.Toggle("見た目をなめらかにする(実験的)", smoothAppearance);
+        if (smoothAppearance)
+            smoothIterations = EditorGUILayout.IntSlider("スムージング強度", smoothIterations, 1, 50);
+
         if (GUILayout.Button("Subdivide"))
         {
-            MeshMulti.SubdivideSelected(selected);
+            MeshMulti.SubdivideSelected(selected, smoothAppearance, smoothIterations);
         }
     }
 }
