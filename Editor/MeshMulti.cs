@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 public static class MeshMulti
 {
@@ -197,7 +198,10 @@ public static class MeshMulti
         }
 
         Mesh newMesh = new Mesh();
-        newMesh.indexFormat = mesh.indexFormat;
+        if (newVertices.Count > 65535)
+            newMesh.indexFormat = IndexFormat.UInt32;
+        else
+            newMesh.indexFormat = mesh.indexFormat;
         newMesh.subMeshCount = subMeshCount;
         newMesh.vertices = newVertices.ToArray();
         if (uvSets[0].Length > 0) newMesh.uv = newUVs[0].ToArray();
