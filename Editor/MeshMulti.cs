@@ -28,7 +28,10 @@ public static class MeshMulti
 
             var newMesh = SubdivideMesh(originalMesh);
             if (smooth)
+            {
                 ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total);
+                OptimizeMesh(newMesh, 1e-4f, 1e-6f);
+            }
 
             float percent = ((float)(i + 1) / total) * 100f;
             percent = Mathf.Floor(percent * 1000f) / 1000f;
@@ -195,6 +198,466 @@ public static class MeshMulti
         mesh.RecalculateBounds();
         mesh.RecalculateNormals();
         mesh.RecalculateTangents();
+    }
+
+    private struct TriangleData
+    {
+        public int a;
+        public int b;
+        public int c;
+        public int subMesh;
+
+        public bool Contains(int v)
+        {
+            return a == v || b == v || c == v;
+        }
+    }
+
+    private static void OptimizeMesh(Mesh mesh, float planarTolerance = 1e-4f, float linearTolerance = 1e-6f)
+    {
+        if (mesh == null || mesh.vertexCount == 0) return;
+
+        Vector3[] vertices = mesh.vertices;
+        Vector2[] uv = mesh.uv;
+        Vector2[] uv2 = mesh.uv2;
+        Vector2[] uv3 = mesh.uv3;
+        Vector2[] uv4 = mesh.uv4;
+        Vector3[] normals = mesh.normals;
+        Vector4[] tangents = mesh.tangents;
+        Color[] colors = mesh.colors;
+        BoneWeight[] boneWeights = mesh.boneWeights;
+        Matrix4x4[] bindposes = mesh.bindposes;
+
+        int subMeshCount = mesh.subMeshCount;
+        var triangles = new List<TriangleData>();
+        for (int s = 0; s < subMeshCount; s++)
+        {
+            int[] subTriangles = mesh.GetTriangles(s);
+            for (int i = 0; i < subTriangles.Length; i += 3)
+            {
+                triangles.Add(new TriangleData
+                {
+                    a = subTriangles[i],
+                    b = subTriangles[i + 1],
+                    c = subTriangles[i + 2],
+                    subMesh = s
+                });
+            }
+        }
+
+        if (triangles.Count == 0) return;
+
+        RemoveDegenerateTriangles(triangles, vertices, linearTolerance);
+
+        bool[] removedVertices = new bool[vertices.Length];
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+            var vertexTriangles = BuildVertexTriangleMap(vertices.Length, triangles, removedVertices);
+            for (int v = 0; v < vertices.Length; v++)
+            {
+                if (removedVertices[v]) continue;
+                var connected = vertexTriangles[v];
+                if (connected == null || connected.Count < 3) continue;
+
+                List<int> orderedNeighbors;
+                int subMesh;
+                if (!TryGetNeighborLoop(v, connected, triangles, removedVertices, out orderedNeighbors, out subMesh))
+                    continue;
+
+                if (!IsPlanarRegion(v, orderedNeighbors, vertices, planarTolerance))
+                    continue;
+
+                if (!IsConvexPolygon(orderedNeighbors, vertices, planarTolerance))
+                    continue;
+
+                RemoveTrianglesWithVertex(triangles, v);
+                TriangulatePolygon(orderedNeighbors, triangles, vertices, subMesh);
+                removedVertices[v] = true;
+                changed = true;
+                break;
+            }
+        }
+
+        RemoveDegenerateTriangles(triangles, vertices, linearTolerance);
+        RemoveUnusedVertices(triangles, removedVertices);
+
+        int[] remap = new int[vertices.Length];
+        int newCount = 0;
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            if (removedVertices[i])
+                remap[i] = -1;
+            else
+            {
+                remap[i] = newCount;
+                newCount++;
+            }
+        }
+
+        var newVertices = new List<Vector3>(newCount);
+        var newUV = (uv.Length == vertices.Length) ? new List<Vector2>(newCount) : null;
+        var newUV2 = (uv2.Length == vertices.Length) ? new List<Vector2>(newCount) : null;
+        var newUV3 = (uv3.Length == vertices.Length) ? new List<Vector2>(newCount) : null;
+        var newUV4 = (uv4.Length == vertices.Length) ? new List<Vector2>(newCount) : null;
+        var newNormals = (normals.Length == vertices.Length) ? new List<Vector3>(newCount) : null;
+        var newTangents = (tangents.Length == vertices.Length) ? new List<Vector4>(newCount) : null;
+        var newColors = (colors.Length == vertices.Length) ? new List<Color>(newCount) : null;
+        var newBoneWeights = (boneWeights.Length == vertices.Length) ? new List<BoneWeight>(newCount) : null;
+
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            if (remap[i] < 0) continue;
+            newVertices.Add(vertices[i]);
+            if (newUV != null) newUV.Add(uv[i]);
+            if (newUV2 != null) newUV2.Add(uv2[i]);
+            if (newUV3 != null) newUV3.Add(uv3[i]);
+            if (newUV4 != null) newUV4.Add(uv4[i]);
+            if (newNormals != null) newNormals.Add(normals[i]);
+            if (newTangents != null) newTangents.Add(tangents[i]);
+            if (newColors != null) newColors.Add(colors[i]);
+            if (newBoneWeights != null) newBoneWeights.Add(boneWeights[i]);
+        }
+
+        var blendShapes = CaptureBlendShapes(mesh);
+        foreach (var bs in blendShapes)
+        {
+            foreach (var frame in bs.frames)
+            {
+                frame.deltaVertices = Remap(frame.deltaVertices, remap);
+                frame.deltaNormals = Remap(frame.deltaNormals, remap);
+                frame.deltaTangents = Remap(frame.deltaTangents, remap);
+            }
+        }
+
+        var trianglesPerSubMesh = new List<int>[subMeshCount];
+        for (int s = 0; s < subMeshCount; s++)
+            trianglesPerSubMesh[s] = new List<int>();
+
+        for (int i = 0; i < triangles.Count; i++)
+        {
+            TriangleData tri = triangles[i];
+            if (remap[tri.a] < 0 || remap[tri.b] < 0 || remap[tri.c] < 0) continue;
+            trianglesPerSubMesh[tri.subMesh].Add(remap[tri.a]);
+            trianglesPerSubMesh[tri.subMesh].Add(remap[tri.b]);
+            trianglesPerSubMesh[tri.subMesh].Add(remap[tri.c]);
+        }
+
+        mesh.Clear();
+        mesh.indexFormat = (newVertices.Count > 65535) ? IndexFormat.UInt32 : IndexFormat.UInt16;
+        mesh.vertices = newVertices.ToArray();
+        if (newUV != null) mesh.uv = newUV.ToArray();
+        if (newUV2 != null) mesh.uv2 = newUV2.ToArray();
+        if (newUV3 != null) mesh.uv3 = newUV3.ToArray();
+        if (newUV4 != null) mesh.uv4 = newUV4.ToArray();
+        if (newNormals != null) mesh.normals = newNormals.ToArray();
+        if (newTangents != null) mesh.tangents = newTangents.ToArray();
+        if (newColors != null) mesh.colors = newColors.ToArray();
+        if (newBoneWeights != null) mesh.boneWeights = newBoneWeights.ToArray();
+        if (bindposes != null && bindposes.Length > 0) mesh.bindposes = bindposes;
+
+        mesh.subMeshCount = subMeshCount;
+        for (int s = 0; s < subMeshCount; s++)
+            mesh.SetTriangles(trianglesPerSubMesh[s], s);
+
+        foreach (var bs in blendShapes)
+        {
+            foreach (var frame in bs.frames)
+            {
+                mesh.AddBlendShapeFrame(bs.name, frame.weight,
+                    frame.deltaVertices.ToArray(),
+                    frame.deltaNormals.ToArray(),
+                    frame.deltaTangents.ToArray());
+            }
+        }
+
+        mesh.RecalculateBounds();
+        mesh.RecalculateNormals();
+        mesh.RecalculateTangents();
+    }
+
+    private static void RemoveDegenerateTriangles(List<TriangleData> triangles, Vector3[] vertices, float tolerance)
+    {
+        float threshold = tolerance * tolerance;
+        for (int i = triangles.Count - 1; i >= 0; i--)
+        {
+            TriangleData tri = triangles[i];
+            Vector3 a = vertices[tri.a];
+            Vector3 b = vertices[tri.b];
+            Vector3 c = vertices[tri.c];
+            float area = Vector3.Cross(b - a, c - a).sqrMagnitude;
+            if (area <= threshold)
+                triangles.RemoveAt(i);
+        }
+    }
+
+    private static List<int>[] BuildVertexTriangleMap(int vertexCount, List<TriangleData> triangles, bool[] removed)
+    {
+        var map = new List<int>[vertexCount];
+        for (int i = 0; i < triangles.Count; i++)
+        {
+            TriangleData tri = triangles[i];
+            if (removed[tri.a] || removed[tri.b] || removed[tri.c]) continue;
+            if (map[tri.a] == null) map[tri.a] = new List<int>();
+            if (map[tri.b] == null) map[tri.b] = new List<int>();
+            if (map[tri.c] == null) map[tri.c] = new List<int>();
+            map[tri.a].Add(i);
+            map[tri.b].Add(i);
+            map[tri.c].Add(i);
+        }
+        return map;
+    }
+
+    private static bool TryGetNeighborLoop(int vertexIndex, List<int> connectedTriangles, List<TriangleData> triangles, bool[] removedVertices, out List<int> orderedNeighbors, out int subMesh)
+    {
+        orderedNeighbors = null;
+        subMesh = -1;
+        var adjacency = new Dictionary<int, List<int>>();
+
+        for (int i = 0; i < connectedTriangles.Count; i++)
+        {
+            TriangleData tri = triangles[connectedTriangles[i]];
+            if (removedVertices[tri.a] || removedVertices[tri.b] || removedVertices[tri.c])
+                continue;
+
+            if (subMesh == -1)
+                subMesh = tri.subMesh;
+            else if (subMesh != tri.subMesh)
+                return false;
+
+            int n0, n1;
+            if (tri.a == vertexIndex)
+            {
+                n0 = tri.b; n1 = tri.c;
+            }
+            else if (tri.b == vertexIndex)
+            {
+                n0 = tri.c; n1 = tri.a;
+            }
+            else
+            {
+                n0 = tri.a; n1 = tri.b;
+            }
+
+            if (removedVertices[n0] || removedVertices[n1])
+                return false;
+
+            AddNeighbor(adjacency, n0, n1);
+            AddNeighbor(adjacency, n1, n0);
+        }
+
+        if (adjacency.Count < 3) return false;
+
+        foreach (var kv in adjacency)
+        {
+            if (kv.Value.Count != 2)
+                return false;
+        }
+
+        int start = -1;
+        foreach (var kv in adjacency)
+        {
+            start = kv.Key;
+            break;
+        }
+        if (start == -1) return false;
+
+        orderedNeighbors = new List<int>(adjacency.Count);
+        int current = start;
+        int prev = -1;
+        for (int count = 0; count < adjacency.Count; count++)
+        {
+            orderedNeighbors.Add(current);
+            var neighbors = adjacency[current];
+            int next = (neighbors[0] == prev) ? neighbors[1] : neighbors[0];
+            prev = current;
+            current = next;
+        }
+
+        if (current != start)
+            return false;
+
+        return true;
+    }
+
+    private static void AddNeighbor(Dictionary<int, List<int>> adjacency, int key, int value)
+    {
+        List<int> list;
+        if (!adjacency.TryGetValue(key, out list))
+        {
+            list = new List<int>(2);
+            adjacency[key] = list;
+        }
+        if (!list.Contains(value))
+            list.Add(value);
+    }
+
+    private static bool IsPlanarRegion(int center, List<int> neighbors, Vector3[] vertices, float tolerance)
+    {
+        if (neighbors.Count < 3) return false;
+
+        Vector3 normal = Vector3.zero;
+        bool normalValid = false;
+        float areaThreshold = tolerance * tolerance;
+        for (int i = 0; i < neighbors.Count; i++)
+        {
+            Vector3 p0 = vertices[neighbors[i]];
+            Vector3 p1 = vertices[neighbors[(i + 1) % neighbors.Count]];
+            Vector3 p2 = vertices[center];
+            Vector3 n = Vector3.Cross(p1 - p0, p2 - p0);
+            if (n.sqrMagnitude > areaThreshold)
+            {
+                normal = n.normalized;
+                normalValid = true;
+                break;
+            }
+        }
+        if (!normalValid) return false;
+
+        float d = -Vector3.Dot(normal, vertices[center]);
+        for (int i = 0; i < neighbors.Count; i++)
+        {
+            Vector3 p = vertices[neighbors[i]];
+            float dist = Mathf.Abs(Vector3.Dot(normal, p) + d);
+            if (dist > tolerance)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsConvexPolygon(List<int> neighbors, Vector3[] vertices, float tolerance)
+    {
+        if (neighbors.Count < 3) return false;
+
+        Vector3 normal = Vector3.zero;
+        float threshold = tolerance * tolerance;
+        for (int i = 0; i < neighbors.Count; i++)
+        {
+            Vector3 p0 = vertices[neighbors[i]];
+            Vector3 p1 = vertices[neighbors[(i + 1) % neighbors.Count]];
+            Vector3 p2 = vertices[neighbors[(i + 2) % neighbors.Count]];
+            Vector3 cross = Vector3.Cross(p1 - p0, p2 - p1);
+            if (cross.sqrMagnitude > threshold)
+            {
+                normal = cross.normalized;
+                break;
+            }
+        }
+        if (normal == Vector3.zero) return false;
+
+        for (int i = 0; i < neighbors.Count; i++)
+        {
+            Vector3 p0 = vertices[neighbors[i]];
+            Vector3 p1 = vertices[neighbors[(i + 1) % neighbors.Count]];
+            Vector3 p2 = vertices[neighbors[(i + 2) % neighbors.Count]];
+            Vector3 cross = Vector3.Cross(p1 - p0, p2 - p1);
+            if (Vector3.Dot(cross, normal) < -tolerance)
+                return false;
+        }
+
+        return true;
+    }
+
+    private static void RemoveTrianglesWithVertex(List<TriangleData> triangles, int vertex)
+    {
+        for (int i = triangles.Count - 1; i >= 0; i--)
+        {
+            if (triangles[i].Contains(vertex))
+                triangles.RemoveAt(i);
+        }
+    }
+
+    private static void TriangulatePolygon(List<int> neighbors, List<TriangleData> triangles, Vector3[] vertices, int subMesh)
+    {
+        if (neighbors.Count < 3) return;
+
+        Vector3 normal = Vector3.zero;
+        for (int i = 0; i < neighbors.Count; i++)
+        {
+            Vector3 p0 = vertices[neighbors[i]];
+            Vector3 p1 = vertices[neighbors[(i + 1) % neighbors.Count]];
+            Vector3 p2 = vertices[neighbors[(i + 2) % neighbors.Count]];
+            Vector3 cross = Vector3.Cross(p1 - p0, p2 - p1);
+            if (cross.sqrMagnitude > 1e-12f)
+            {
+                normal = cross.normalized;
+                break;
+            }
+        }
+
+        int anchor = neighbors[0];
+        for (int i = 1; i < neighbors.Count - 1; i++)
+        {
+            int b = neighbors[i];
+            int c = neighbors[i + 1];
+            Vector3 pa = vertices[anchor];
+            Vector3 pb = vertices[b];
+            Vector3 pc = vertices[c];
+            Vector3 triNormal = Vector3.Cross(pb - pa, pc - pa);
+            if (Vector3.Dot(triNormal, normal) < 0f)
+            {
+                int temp = b;
+                b = c;
+                c = temp;
+            }
+            triangles.Add(new TriangleData { a = anchor, b = b, c = c, subMesh = subMesh });
+        }
+    }
+
+    private static void RemoveUnusedVertices(List<TriangleData> triangles, bool[] removed)
+    {
+        var used = new bool[removed.Length];
+        for (int i = 0; i < triangles.Count; i++)
+        {
+            TriangleData tri = triangles[i];
+            used[tri.a] = true;
+            used[tri.b] = true;
+            used[tri.c] = true;
+        }
+        for (int i = 0; i < removed.Length; i++)
+            if (!used[i]) removed[i] = true;
+    }
+
+    private static List<Vector3> Remap(List<Vector3> source, int[] remap)
+    {
+        var result = new List<Vector3>(remap.Length);
+        if (source == null || source.Count != remap.Length) return result;
+        for (int i = 0; i < remap.Length; i++)
+        {
+            if (remap[i] >= 0)
+                result.Add(source[i]);
+        }
+        return result;
+    }
+
+    private static List<BlendShape> CaptureBlendShapes(Mesh mesh)
+    {
+        var blendShapes = new List<BlendShape>();
+        int vertexCount = mesh.vertexCount;
+        for (int i = 0; i < mesh.blendShapeCount; i++)
+        {
+            var bs = new BlendShape { name = mesh.GetBlendShapeName(i) };
+            int frameCount = mesh.GetBlendShapeFrameCount(i);
+            for (int j = 0; j < frameCount; j++)
+            {
+                float weight = mesh.GetBlendShapeFrameWeight(i, j);
+                var dv = new Vector3[vertexCount];
+                var dn = new Vector3[vertexCount];
+                var dt = new Vector3[vertexCount];
+                mesh.GetBlendShapeFrameVertices(i, j, dv, dn, dt);
+                bs.frames.Add(new BlendShapeFrame
+                {
+                    weight = weight,
+                    deltaVertices = new List<Vector3>(dv),
+                    deltaNormals = new List<Vector3>(dn),
+                    deltaTangents = new List<Vector3>(dt)
+                });
+            }
+            blendShapes.Add(bs);
+        }
+        return blendShapes;
     }
 
     private class Vector3EqualityComparer : IEqualityComparer<Vector3>
