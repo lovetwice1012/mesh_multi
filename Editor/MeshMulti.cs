@@ -159,9 +159,59 @@ public static class MeshMulti
         return mesh.vertexCount + edges.Count;
     }
 
-    public static int PredictSubdividedTriangleCount(Mesh mesh)
+    public static int PredictSubdividedTriangleCount(Mesh mesh, bool[] vertexMask = null)
     {
-        return mesh.triangles.Length / 3 * 4;
+        int triangleCount = mesh.triangles.Length / 3;
+        bool useMask = vertexMask != null && vertexMask.Length == mesh.vertexCount;
+        bool anyMasked = false;
+        if (useMask)
+        {
+            for (int i = 0; i < vertexMask.Length; i++)
+            {
+                if (vertexMask[i])
+                {
+                    anyMasked = true;
+                    break;
+                }
+            }
+            if (!anyMasked)
+                return triangleCount;
+        }
+
+        if (!useMask)
+            return triangleCount * 4;
+
+        int[] triangles = mesh.triangles;
+        int predicted = 0;
+        for (int i = 0; i < triangles.Length; i += 3)
+        {
+            int v0 = triangles[i];
+            int v1 = triangles[i + 1];
+            int v2 = triangles[i + 2];
+
+            bool e01 = vertexMask[v0] || vertexMask[v1];
+            bool e12 = vertexMask[v1] || vertexMask[v2];
+            bool e20 = vertexMask[v2] || vertexMask[v0];
+            int flagged = (e01 ? 1 : 0) + (e12 ? 1 : 0) + (e20 ? 1 : 0);
+
+            switch (flagged)
+            {
+                case 0:
+                    predicted += 1;
+                    break;
+                case 1:
+                    predicted += 2;
+                    break;
+                case 2:
+                    predicted += 3;
+                    break;
+                default:
+                    predicted += 4;
+                    break;
+            }
+        }
+
+        return predicted;
     }
 
     private static void ThinPlateSmooth(Mesh mesh, int iterations = 10, float lambda = 0.1f, int meshIndex = 0, int meshTotal = 1, bool[] vertexMask = null)
@@ -1335,7 +1385,7 @@ public class MeshMultiWindow : EditorWindow
             bool inRange = !restrictToBounds || (boundsValid && hasVerticesInBounds);
             if (inRange) includedRenderers++;
             int predictedVertices = MeshMulti.PredictSubdividedVertexCount(mesh, (restrictToBounds && boundsValid) ? mask : null);
-            int predictedTriangles = MeshMulti.PredictSubdividedTriangleCount(mesh);
+            int predictedTriangles = MeshMulti.PredictSubdividedTriangleCount(mesh, (restrictToBounds && boundsValid) ? mask : null);
             string label = string.Format(
                 "Vertices: {0} → {1}, Triangles: {2} → {3}",
                 mesh.vertexCount,
