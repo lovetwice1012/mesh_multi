@@ -7,7 +7,7 @@ using UnityEngine.Rendering;
 
 public static class MeshMulti
 {
-    public static void SubdivideSelected(GameObject selected, bool smooth, int smoothIterations = 10)
+    public static void SubdivideSelected(GameObject selected, bool smooth, int smoothIterations = 10, Bounds? limitBounds = null)
     {
         if (selected == null)
         {
@@ -16,10 +16,53 @@ public static class MeshMulti
         }
 
         var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
-        int total = renderers.Length;
+        var targetRenderers = new List<SkinnedMeshRenderer>();
+        if (limitBounds.HasValue)
+        {
+            Bounds bounds = limitBounds.Value;
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                var renderer = renderers[i];
+                var mesh = renderer.sharedMesh;
+                if (mesh == null)
+                    continue;
+
+                var insideMask = CalculateVerticesInsideBounds(renderer, mesh, bounds);
+                bool anyInside = false;
+                for (int v = 0; v < insideMask.Length; v++)
+                {
+                    if (insideMask[v])
+                    {
+                        anyInside = true;
+                        break;
+                    }
+                }
+
+                if (anyInside)
+                    targetRenderers.Add(renderer);
+            }
+
+            if (targetRenderers.Count == 0)
+            {
+                Debug.LogWarning("No skinned mesh vertices found within the specified bounds.");
+                return;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                var mesh = renderers[i].sharedMesh;
+                if (mesh == null)
+                    continue;
+                targetRenderers.Add(renderers[i]);
+            }
+        }
+
+        int total = targetRenderers.Count;
         for (int i = 0; i < total; i++)
         {
-            var renderer = renderers[i];
+            var renderer = targetRenderers[i];
             EditorUtility.DisplayProgressBar("Subdivide Meshes", $"Processing {i + 1}/{total}: {renderer.name}", (float)i / total);
 
             var originalMesh = renderer.sharedMesh;
@@ -29,7 +72,12 @@ public static class MeshMulti
             var newMesh = SubdivideMesh(originalMesh);
             if (smooth)
             {
-                ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total);
+                bool[] smoothedVertices = null;
+                if (limitBounds.HasValue)
+                {
+                    smoothedVertices = CalculateVerticesInsideBounds(renderer, newMesh, limitBounds.Value);
+                }
+                ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total, smoothedVertices);
                 OptimizeMesh(newMesh, 1e-4f, 1e-6f);
             }
 
@@ -58,7 +106,7 @@ public static class MeshMulti
         EditorUtility.ClearProgressBar();
 
         float finalPercent = Mathf.Floor(100f * 1000f) / 1000f;
-        Debug.Log(string.Format("Subdivided {0} meshes under '{1}' ({2:F3}%).", renderers.Length, selected.name, finalPercent));
+        Debug.Log(string.Format("Subdivided {0} meshes under '{1}' ({2:F3}%).", targetRenderers.Count, selected.name, finalPercent));
     }
 
     public static int PredictSubdividedVertexCount(Mesh mesh)
@@ -82,7 +130,7 @@ public static class MeshMulti
         return mesh.triangles.Length / 3 * 4;
     }
 
-    private static void ThinPlateSmooth(Mesh mesh, int iterations = 10, float lambda = 0.1f, int meshIndex = 0, int meshTotal = 1)
+    private static void ThinPlateSmooth(Mesh mesh, int iterations = 10, float lambda = 0.1f, int meshIndex = 0, int meshTotal = 1, bool[] vertexMask = null)
     {
         var vertices = mesh.vertices;
         var originalVertices = (Vector3[])vertices.Clone();
@@ -142,6 +190,7 @@ public static class MeshMulti
 
             for (int i = 0; i < vertices.Length; i++)
             {
+                if (vertexMask != null && !vertexMask[i]) { lap[i] = Vector3.zero; continue; }
                 if (adjacency[i].Count == 0) { lap[i] = Vector3.zero; continue; }
                 Vector3 sum = Vector3.zero;
                 foreach (var n in adjacency[i]) sum += vertices[n];
@@ -149,6 +198,7 @@ public static class MeshMulti
             }
             for (int i = 0; i < vertices.Length; i++)
             {
+                if (vertexMask != null && !vertexMask[i]) { lap2[i] = Vector3.zero; continue; }
                 if (adjacency[i].Count == 0) { lap2[i] = Vector3.zero; continue; }
                 Vector3 sum = Vector3.zero;
                 foreach (var n in adjacency[i]) sum += lap[n];
@@ -157,16 +207,37 @@ public static class MeshMulti
             // Subtracting moves vertices toward lower curvature. Using addition here
             // would amplify curvature and can explode the mesh during smoothing.
             for (int i = 0; i < vertices.Length; i++)
+            {
+                if (vertexMask != null && !vertexMask[i])
+                    continue;
                 vertices[i] -= lambda * lap2[i];
+            }
 
             // Keep duplicate-position vertices welded together
             foreach (var group in positionGroups.Values)
             {
                 if (group.Count < 2) continue;
-                Vector3 avg = Vector3.zero;
-                foreach (var idx in group) avg += vertices[idx];
-                avg /= group.Count;
-                foreach (var idx in group) vertices[idx] = avg;
+                if (vertexMask == null)
+                {
+                    Vector3 avg = Vector3.zero;
+                    foreach (var idx in group) avg += vertices[idx];
+                    avg /= group.Count;
+                    foreach (var idx in group) vertices[idx] = avg;
+                }
+                else
+                {
+                    var insideMembers = new List<int>();
+                    for (int g = 0; g < group.Count; g++)
+                    {
+                        int idx = group[g];
+                        if (vertexMask[idx]) insideMembers.Add(idx);
+                    }
+                    if (insideMembers.Count < 2) continue;
+                    Vector3 avg = Vector3.zero;
+                    foreach (var idx in insideMembers) avg += vertices[idx];
+                    avg /= insideMembers.Count;
+                    foreach (var idx in insideMembers) vertices[idx] = avg;
+                }
             }
         }
 
@@ -176,10 +247,28 @@ public static class MeshMulti
             foreach (var group in positionGroups.Values)
             {
                 if (group.Count < 2) continue;
-                var weights = new List<BoneWeight>(group.Count);
-                foreach (var idx in group) weights.Add(boneWeights[idx]);
-                var avgWeight = AverageBoneWeights(weights);
-                foreach (var idx in group) boneWeights[idx] = avgWeight;
+                if (vertexMask == null)
+                {
+                    var weights = new List<BoneWeight>(group.Count);
+                    foreach (var idx in group) weights.Add(boneWeights[idx]);
+                    var avgWeight = AverageBoneWeights(weights);
+                    foreach (var idx in group) boneWeights[idx] = avgWeight;
+                }
+                else
+                {
+                    var insideWeights = new List<BoneWeight>();
+                    foreach (var idx in group)
+                    {
+                        if (vertexMask[idx]) insideWeights.Add(boneWeights[idx]);
+                    }
+                    if (insideWeights.Count < 2) continue;
+                    var avgWeight = AverageBoneWeights(insideWeights);
+                    foreach (var idx in group)
+                    {
+                        if (vertexMask[idx])
+                            boneWeights[idx] = avgWeight;
+                    }
+                }
             }
         }
 
@@ -198,6 +287,19 @@ public static class MeshMulti
         mesh.RecalculateBounds();
         mesh.RecalculateNormals();
         mesh.RecalculateTangents();
+    }
+
+    internal static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds)
+    {
+        var vertices = mesh.vertices;
+        var inside = new bool[vertices.Length];
+        Matrix4x4 localToWorld = renderer.transform.localToWorldMatrix;
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            Vector3 world = localToWorld.MultiplyPoint3x4(vertices[i]);
+            inside[i] = bounds.Contains(world);
+        }
+        return inside;
     }
 
     private struct TriangleData
@@ -1014,11 +1116,29 @@ public class MeshMultiWindow : EditorWindow
 {
     private bool smoothAppearance;
     private int smoothIterations = 10;
+    private bool restrictToBounds;
+    private Vector3 boundsCenter;
+    private Vector3 boundsSize = Vector3.one;
+    private static readonly Color BoundsFillColor = new Color(1f, 0.6f, 0f, 0.15f);
+    private static readonly Color BoundsOutlineColor = new Color(1f, 0.6f, 0f, 0.6f);
 
     [MenuItem("yussy/Subdivide Skinned Meshes")]
     private static void ShowWindow()
     {
         GetWindow<MeshMultiWindow>("Subdivide Meshes");
+    }
+
+    private void OnEnable()
+    {
+        SceneView.duringSceneGui += OnSceneGUI;
+        SyncBoundsWithSelection();
+        Selection.selectionChanged += OnSelectionChanged;
+    }
+
+    private void OnDisable()
+    {
+        SceneView.duringSceneGui -= OnSceneGUI;
+        Selection.selectionChanged -= OnSelectionChanged;
     }
 
     private void OnGUI()
@@ -1030,21 +1150,94 @@ public class MeshMultiWindow : EditorWindow
             return;
         }
 
+        EditorGUI.BeginChangeCheck();
+        restrictToBounds = EditorGUILayout.Toggle("座標範囲を指定する", restrictToBounds);
+        if (restrictToBounds)
+        {
+            boundsCenter = EditorGUILayout.Vector3Field("範囲中心", boundsCenter);
+            Vector3 sizeInput = EditorGUILayout.Vector3Field("範囲サイズ", boundsSize);
+            boundsSize = new Vector3(Mathf.Max(0f, Mathf.Abs(sizeInput.x)), Mathf.Max(0f, Mathf.Abs(sizeInput.y)), Mathf.Max(0f, Mathf.Abs(sizeInput.z)));
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("選択から範囲を取得"))
+                {
+                    var calculated = CalculateSelectionBounds(selected);
+                    boundsCenter = calculated.center;
+                    boundsSize = calculated.size;
+                }
+                if (GUILayout.Button("範囲をリセット"))
+                {
+                    boundsCenter = Vector3.zero;
+                    boundsSize = Vector3.one;
+                }
+            }
+        }
+        if (EditorGUI.EndChangeCheck())
+        {
+            SceneView.RepaintAll();
+        }
+
         var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
+        Bounds activeBounds = new Bounds(boundsCenter, boundsSize);
+        bool boundsValid = boundsSize.x > 0f && boundsSize.y > 0f && boundsSize.z > 0f;
+        int includedRenderers = 0;
         foreach (var renderer in renderers)
         {
             var mesh = renderer.sharedMesh;
             if (mesh == null) continue;
+
+            bool hasVerticesInBounds = false;
+            bool[] mask = null;
+            if (restrictToBounds && boundsValid)
+            {
+                mask = MeshMulti.CalculateVerticesInsideBounds(renderer, mesh, activeBounds);
+                for (int v = 0; v < mask.Length; v++)
+                {
+                    if (mask[v])
+                    {
+                        hasVerticesInBounds = true;
+                        break;
+                    }
+                }
+            }
+
+            bool inRange = !restrictToBounds || (boundsValid && hasVerticesInBounds);
+            if (inRange) includedRenderers++;
             int predictedVertices = MeshMulti.PredictSubdividedVertexCount(mesh);
             int predictedTriangles = MeshMulti.PredictSubdividedTriangleCount(mesh);
-            EditorGUILayout.LabelField(
-                mesh.name,
-                string.Format(
-                    "Vertices: {0} → {1}, Triangles: {2} → {3}",
-                    mesh.vertexCount,
-                    predictedVertices,
-                    mesh.triangles.Length / 3,
-                    predictedTriangles));
+            string label = string.Format(
+                "Vertices: {0} → {1}, Triangles: {2} → {3}",
+                mesh.vertexCount,
+                predictedVertices,
+                mesh.triangles.Length / 3,
+                predictedTriangles);
+            if (!inRange && restrictToBounds)
+            {
+                label += "（範囲外）";
+            }
+            else if (restrictToBounds && boundsValid)
+            {
+                int insideCount = 0;
+                if (mask != null)
+                {
+                    for (int v = 0; v < mask.Length; v++)
+                        if (mask[v]) insideCount++;
+                }
+                label += string.Format("（範囲内の頂点 {0} 個）", insideCount);
+            }
+            EditorGUILayout.LabelField(mesh.name, label);
+        }
+
+        if (restrictToBounds)
+        {
+            if (!boundsValid)
+            {
+                EditorGUILayout.HelpBox("範囲サイズがゼロの軸があるため、現在の設定ではメッシュが選択されません。", MessageType.Warning);
+            }
+            else
+            {
+                EditorGUILayout.HelpBox(string.Format("範囲内に頂点を持つメッシュ {0}/{1} 個が対象になります。", includedRenderers, renderers.Length), MessageType.Info);
+            }
         }
 
         smoothAppearance = EditorGUILayout.Toggle("見た目をなめらかにする(実験的)", smoothAppearance);
@@ -1053,7 +1246,119 @@ public class MeshMultiWindow : EditorWindow
 
         if (GUILayout.Button("Subdivide"))
         {
-            MeshMulti.SubdivideSelected(selected, smoothAppearance, smoothIterations);
+            if (restrictToBounds && !boundsValid)
+            {
+                EditorUtility.DisplayDialog("範囲が無効です", "範囲サイズのいずれかがゼロのため、細分化を実行できません。サイズを調整してください。", "OK");
+                return;
+            }
+
+            Bounds? bounds = null;
+            if (restrictToBounds && boundsValid)
+                bounds = new Bounds(boundsCenter, boundsSize);
+            MeshMulti.SubdivideSelected(selected, smoothAppearance, smoothIterations, bounds);
         }
+    }
+
+    private void OnSceneGUI(SceneView sceneView)
+    {
+        if (!restrictToBounds)
+            return;
+
+        if (boundsSize.x <= 0f || boundsSize.y <= 0f || boundsSize.z <= 0f)
+            return;
+
+        DrawBounds(boundsCenter, boundsSize);
+    }
+
+    private void DrawBounds(Vector3 center, Vector3 size)
+    {
+        Vector3 extents = size * 0.5f;
+        var prevColor = Handles.color;
+        var prevZTest = Handles.zTest;
+        Handles.zTest = CompareFunction.LessEqual;
+
+        Vector3[] faceNormals =
+        {
+            Vector3.up,
+            Vector3.down,
+            Vector3.left,
+            Vector3.right,
+            Vector3.forward,
+            Vector3.back
+        };
+        Vector3[] faceRight =
+        {
+            Vector3.right,
+            Vector3.right,
+            Vector3.forward,
+            Vector3.forward,
+            Vector3.right,
+            Vector3.right
+        };
+        Vector3[] faceUp =
+        {
+            Vector3.forward,
+            Vector3.forward,
+            Vector3.up,
+            Vector3.up,
+            Vector3.up,
+            Vector3.up
+        };
+
+        for (int i = 0; i < faceNormals.Length; i++)
+        {
+            Vector3 normal = faceNormals[i];
+            Vector3 right = faceRight[i];
+            Vector3 up = faceUp[i];
+
+            Vector3 faceCenter = center + Vector3.Scale(normal, extents);
+            Vector3 rightOffset = Vector3.Scale(right, extents);
+            Vector3 upOffset = Vector3.Scale(up, extents);
+
+            Vector3[] verts = new Vector3[4];
+            verts[0] = faceCenter + rightOffset + upOffset;
+            verts[1] = faceCenter + rightOffset - upOffset;
+            verts[2] = faceCenter - rightOffset - upOffset;
+            verts[3] = faceCenter - rightOffset + upOffset;
+
+            Handles.DrawSolidRectangleWithOutline(verts, BoundsFillColor, BoundsOutlineColor);
+        }
+
+        Handles.color = BoundsOutlineColor;
+        Handles.DrawWireCube(center, size);
+
+        Handles.color = prevColor;
+        Handles.zTest = prevZTest;
+    }
+
+    private void SyncBoundsWithSelection()
+    {
+        var selected = Selection.activeGameObject;
+        if (selected == null)
+            return;
+
+        var bounds = CalculateSelectionBounds(selected);
+        boundsCenter = bounds.center;
+        boundsSize = bounds.size;
+    }
+
+    private void OnSelectionChanged()
+    {
+        SyncBoundsWithSelection();
+        Repaint();
+        SceneView.RepaintAll();
+    }
+
+    private Bounds CalculateSelectionBounds(GameObject root)
+    {
+        var renderers = root.GetComponentsInChildren<SkinnedMeshRenderer>();
+        if (renderers.Length == 0)
+            return new Bounds(root.transform.position, Vector3.one);
+
+        Bounds combined = renderers[0].bounds;
+        for (int i = 1; i < renderers.Length; i++)
+            combined.Encapsulate(renderers[i].bounds);
+
+        return combined;
     }
 }
