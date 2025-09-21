@@ -89,7 +89,6 @@ public static class MeshMulti
                     }
                 }
                 ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total, smoothedVertices);
-                OptimizeMesh(newMesh, 1e-4f, 1e-6f);
             }
 
             float percent = ((float)(i + 1) / total) * 100f;
