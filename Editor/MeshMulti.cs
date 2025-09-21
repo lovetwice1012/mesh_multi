@@ -120,15 +120,38 @@ public static class MeshMulti
         Debug.Log(string.Format("Subdivided {0} meshes under '{1}' ({2:F3}%).", targetRenderers.Count, selected.name, finalPercent));
     }
 
-    public static int PredictSubdividedVertexCount(Mesh mesh)
+    public static int PredictSubdividedVertexCount(Mesh mesh, bool[] vertexMask = null)
     {
         int[] triangles = mesh.triangles;
         var edges = new HashSet<Edge>();
+        bool useMask = vertexMask != null && vertexMask.Length == mesh.vertexCount;
+        bool anyMasked = false;
+        if (useMask)
+        {
+            for (int i = 0; i < vertexMask.Length; i++)
+            {
+                if (vertexMask[i])
+                {
+                    anyMasked = true;
+                    break;
+                }
+            }
+            if (!anyMasked)
+                return mesh.vertexCount;
+        }
+
         for (int i = 0; i < triangles.Length; i += 3)
         {
             int v0 = triangles[i];
             int v1 = triangles[i + 1];
             int v2 = triangles[i + 2];
+
+            if (useMask && anyMasked)
+            {
+                if (!vertexMask[v0] && !vertexMask[v1] && !vertexMask[v2])
+                    continue;
+            }
+
             edges.Add(new Edge(v0, v1));
             edges.Add(new Edge(v1, v2));
             edges.Add(new Edge(v2, v0));
@@ -1311,7 +1334,7 @@ public class MeshMultiWindow : EditorWindow
 
             bool inRange = !restrictToBounds || (boundsValid && hasVerticesInBounds);
             if (inRange) includedRenderers++;
-            int predictedVertices = MeshMulti.PredictSubdividedVertexCount(mesh);
+            int predictedVertices = MeshMulti.PredictSubdividedVertexCount(mesh, (restrictToBounds && boundsValid) ? mask : null);
             int predictedTriangles = MeshMulti.PredictSubdividedTriangleCount(mesh);
             string label = string.Format(
                 "Vertices: {0} → {1}, Triangles: {2} → {3}",
