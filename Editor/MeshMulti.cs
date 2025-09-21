@@ -69,13 +69,24 @@ public static class MeshMulti
             if (originalMesh == null)
                 continue;
 
-            var newMesh = SubdivideMesh(originalMesh);
+            bool[] subdivisionMaskInput = null;
+            if (limitBounds.HasValue)
+                subdivisionMaskInput = CalculateVerticesInsideBounds(renderer, originalMesh, limitBounds.Value);
+
+            bool[] subdivisionMask;
+            var newMesh = SubdivideMesh(originalMesh, subdivisionMaskInput, out subdivisionMask);
             if (smooth)
             {
                 bool[] smoothedVertices = null;
                 if (limitBounds.HasValue)
                 {
                     smoothedVertices = CalculateVerticesInsideBounds(renderer, newMesh, limitBounds.Value);
+                    if (subdivisionMask != null && smoothedVertices != null)
+                    {
+                        int count = Mathf.Min(subdivisionMask.Length, smoothedVertices.Length);
+                        for (int v = 0; v < count; v++)
+                            smoothedVertices[v] = smoothedVertices[v] || subdivisionMask[v];
+                    }
                 }
                 ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total, smoothedVertices);
                 OptimizeMesh(newMesh, 1e-4f, 1e-6f);
@@ -835,7 +846,7 @@ public static class MeshMulti
         public List<Vector3> deltaTangents;
     }
 
-    private static Mesh SubdivideMesh(Mesh mesh)
+    private static Mesh SubdivideMesh(Mesh mesh, bool[] vertexMask, out bool[] newVertexMask)
     {
         var vertices = mesh.vertices;
         int vertexCount = vertices.Length;
@@ -886,6 +897,9 @@ public static class MeshMulti
         var newTangents = new List<Vector4>(tangents.Length == 0 ? new Vector4[vertexCount] : tangents);
         var newColors = new List<Color>(colors.Length == 0 ? new Color[vertexCount] : colors);
         var newBoneWeights = new List<BoneWeight>(boneWeights.Length == 0 ? new BoneWeight[vertexCount] : boneWeights);
+        List<bool> maskList = null;
+        if (vertexMask != null)
+            maskList = new List<bool>(vertexMask);
 
         var midpointCache = new Dictionary<Edge, int>();
         var newSubTriangles = new List<int>[subMeshCount];
@@ -916,6 +930,11 @@ public static class MeshMulti
             if (tangents.Length > 0) newTangents.Add(tangent);
             if (colors.Length > 0) newColors.Add(color);
             if (boneWeights.Length > 0) newBoneWeights.Add(bw);
+            if (maskList != null)
+            {
+                bool inside = vertexMask[i0] || vertexMask[i1];
+                maskList.Add(inside);
+            }
 
             foreach (var bs in blendShapes)
             {
@@ -938,20 +957,105 @@ public static class MeshMulti
         {
             int[] triangles = mesh.GetTriangles(s);
             List<int> list = newSubTriangles[s];
-            for (int i = 0; i < triangles.Length; i += 3)
+            if (vertexMask == null)
             {
-                int v0 = triangles[i];
-                int v1 = triangles[i + 1];
-                int v2 = triangles[i + 2];
+                for (int i = 0; i < triangles.Length; i += 3)
+                {
+                    int v0 = triangles[i];
+                    int v1 = triangles[i + 1];
+                    int v2 = triangles[i + 2];
 
-                int m0 = getMidpoint(v0, v1);
-                int m1 = getMidpoint(v1, v2);
-                int m2 = getMidpoint(v2, v0);
+                    int m0 = getMidpoint(v0, v1);
+                    int m1 = getMidpoint(v1, v2);
+                    int m2 = getMidpoint(v2, v0);
 
-                list.Add(v0); list.Add(m0); list.Add(m2);
-                list.Add(v1); list.Add(m1); list.Add(m0);
-                list.Add(v2); list.Add(m2); list.Add(m1);
-                list.Add(m0); list.Add(m1); list.Add(m2);
+                    list.Add(v0); list.Add(m0); list.Add(m2);
+                    list.Add(v1); list.Add(m1); list.Add(m0);
+                    list.Add(v2); list.Add(m2); list.Add(m1);
+                    list.Add(m0); list.Add(m1); list.Add(m2);
+                }
+            }
+            else
+            {
+                for (int i = 0; i < triangles.Length; i += 3)
+                {
+                    int v0 = triangles[i];
+                    int v1 = triangles[i + 1];
+                    int v2 = triangles[i + 2];
+
+                    bool e01 = vertexMask[v0] || vertexMask[v1];
+                    bool e12 = vertexMask[v1] || vertexMask[v2];
+                    bool e20 = vertexMask[v2] || vertexMask[v0];
+                    int flagged = (e01 ? 1 : 0) + (e12 ? 1 : 0) + (e20 ? 1 : 0);
+
+                    if (flagged == 0)
+                    {
+                        list.Add(v0); list.Add(v1); list.Add(v2);
+                        continue;
+                    }
+
+                    if (flagged == 3)
+                    {
+                        int m0 = getMidpoint(v0, v1);
+                        int m1 = getMidpoint(v1, v2);
+                        int m2 = getMidpoint(v2, v0);
+
+                        list.Add(v0); list.Add(m0); list.Add(m2);
+                        list.Add(v1); list.Add(m1); list.Add(m0);
+                        list.Add(v2); list.Add(m2); list.Add(m1);
+                        list.Add(m0); list.Add(m1); list.Add(m2);
+                        continue;
+                    }
+
+                    if (flagged == 1)
+                    {
+                        if (e01)
+                        {
+                            int m0 = getMidpoint(v0, v1);
+                            list.Add(v0); list.Add(m0); list.Add(v2);
+                            list.Add(m0); list.Add(v1); list.Add(v2);
+                        }
+                        else if (e12)
+                        {
+                            int m1 = getMidpoint(v1, v2);
+                            list.Add(v1); list.Add(m1); list.Add(v0);
+                            list.Add(m1); list.Add(v2); list.Add(v0);
+                        }
+                        else if (e20)
+                        {
+                            int m2 = getMidpoint(v2, v0);
+                            list.Add(v2); list.Add(m2); list.Add(v1);
+                            list.Add(m2); list.Add(v0); list.Add(v1);
+                        }
+                        continue;
+                    }
+
+                    // flagged == 2 -> exactly one vertex inside the bounds
+                    if (!e20)
+                    {
+                        int m0 = getMidpoint(v0, v1);
+                        int m1 = getMidpoint(v1, v2);
+                        list.Add(v1); list.Add(m1); list.Add(m0);
+                        list.Add(m0); list.Add(m1); list.Add(v2);
+                        list.Add(v0); list.Add(m0); list.Add(v2);
+                    }
+                    else if (!e01)
+                    {
+                        int m1 = getMidpoint(v1, v2);
+                        int m2 = getMidpoint(v2, v0);
+                        list.Add(v2); list.Add(m2); list.Add(m1);
+                        list.Add(m1); list.Add(m2); list.Add(v0);
+                        list.Add(v1); list.Add(m1); list.Add(v0);
+                    }
+                    else // !e12
+                    {
+                        int m2 = getMidpoint(v2, v0);
+                        int m0 = getMidpoint(v0, v1);
+                        list.Add(v0); list.Add(m0); list.Add(m2);
+                        list.Add(m2); list.Add(m0); list.Add(v1);
+                        list.Add(v2); list.Add(m2); list.Add(v1);
+                    }
+                }
             }
         }
 
@@ -990,6 +1094,10 @@ public static class MeshMulti
         if (normals.Length == 0) newMesh.RecalculateNormals();
         if (tangents.Length == 0) newMesh.RecalculateTangents();
         newMesh.name = mesh.name;
+        if (maskList != null)
+            newVertexMask = maskList.ToArray();
+        else
+            newVertexMask = null;
         return newMesh;
     }
 
