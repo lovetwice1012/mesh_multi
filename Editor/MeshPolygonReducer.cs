@@ -119,66 +119,106 @@ public static class MeshPolygonReducer
         if (mesh == null)
             return null;
 
-        int[] triangles = mesh.triangles;
-        int triangleCount = triangles.Length / 3;
-        if (triangleCount == 0)
-            return null;
-
-        List<int> candidateTriangleIndices = new List<int>();
+        int originalSubMeshCount = mesh.subMeshCount;
+        bool hasExplicitSubmeshes = originalSubMeshCount > 0;
+        int subMeshCount = Mathf.Max(1, originalSubMeshCount);
         bool useMask = vertexMask != null && vertexMask.Length == mesh.vertexCount;
-        for (int i = 0; i < triangles.Length; i += 3)
+
+        int totalCandidates = 0;
+        var perSubmeshCandidates = new List<int>[subMeshCount];
+        var perSubmeshTriangles = new int[subMeshCount][];
+
+        for (int subMesh = 0; subMesh < subMeshCount; subMesh++)
         {
-            if (useMask)
+            int[] triangles;
+            if (!hasExplicitSubmeshes && subMesh == 0)
+                triangles = mesh.triangles;
+            else
+                triangles = mesh.GetTriangles(subMesh);
+            perSubmeshTriangles[subMesh] = triangles;
+            var candidates = new List<int>();
+
+            for (int i = 0; i < triangles.Length; i += 3)
             {
-                int v0 = triangles[i];
-                int v1 = triangles[i + 1];
-                int v2 = triangles[i + 2];
-                if (!(vertexMask[v0] && vertexMask[v1] && vertexMask[v2]))
-                    continue;
+                if (useMask)
+                {
+                    int v0 = triangles[i];
+                    int v1 = triangles[i + 1];
+                    int v2 = triangles[i + 2];
+                    if (!(vertexMask[v0] && vertexMask[v1] && vertexMask[v2]))
+                        continue;
+                }
+                candidates.Add(i);
             }
-            candidateTriangleIndices.Add(i);
+
+            perSubmeshCandidates[subMesh] = candidates;
+            totalCandidates += candidates.Count;
         }
 
-        if (candidateTriangleIndices.Count == 0)
+        if (totalCandidates == 0)
             return null;
 
-        int targetRemoval = Mathf.Clamp(Mathf.RoundToInt(candidateTriangleIndices.Count * reductionRatio), 0, candidateTriangleIndices.Count);
-        if (targetRemoval == 0)
-            return null;
+        System.Random random = seed.HasValue
+            ? new System.Random(seed.Value)
+            : new System.Random(mesh.GetInstanceID() ^ totalCandidates ^ DateTime.Now.Millisecond);
 
-        System.Random random;
-        if (seed.HasValue)
-            random = new System.Random(seed.Value);
-        else
-            random = new System.Random(mesh.GetInstanceID() ^ candidateTriangleIndices.Count ^ DateTime.Now.Millisecond);
+        bool removedAny = false;
+        var perSubmeshResults = new List<int>[subMeshCount];
 
-        for (int i = candidateTriangleIndices.Count - 1; i > 0; i--)
+        for (int subMesh = 0; subMesh < subMeshCount; subMesh++)
         {
-            int swapIndex = random.Next(i + 1);
-            int temp = candidateTriangleIndices[i];
-            candidateTriangleIndices[i] = candidateTriangleIndices[swapIndex];
-            candidateTriangleIndices[swapIndex] = temp;
-        }
+            var triangles = perSubmeshTriangles[subMesh];
+            var candidates = perSubmeshCandidates[subMesh];
 
-        var removed = new HashSet<int>();
-        for (int i = 0; i < targetRemoval; i++)
-            removed.Add(candidateTriangleIndices[i]);
-
-        List<int> newTriangles = new List<int>(triangles.Length - removed.Count * 3);
-        for (int i = 0; i < triangles.Length; i += 3)
-        {
-            if (removed.Contains(i))
+            if (triangles.Length == 0 || candidates.Count == 0)
+            {
+                perSubmeshResults[subMesh] = new List<int>(triangles);
                 continue;
-            newTriangles.Add(triangles[i]);
-            newTriangles.Add(triangles[i + 1]);
-            newTriangles.Add(triangles[i + 2]);
+            }
+
+            int targetRemoval = Mathf.Clamp(Mathf.RoundToInt(candidates.Count * reductionRatio), 0, candidates.Count);
+            if (targetRemoval == 0)
+            {
+                perSubmeshResults[subMesh] = new List<int>(triangles);
+                continue;
+            }
+
+            for (int i = candidates.Count - 1; i > 0; i--)
+            {
+                int swapIndex = random.Next(i + 1);
+                int temp = candidates[i];
+                candidates[i] = candidates[swapIndex];
+                candidates[swapIndex] = temp;
+            }
+
+            var removed = new HashSet<int>();
+            for (int i = 0; i < targetRemoval; i++)
+                removed.Add(candidates[i]);
+
+            var newTriangles = new List<int>(triangles.Length - removed.Count * 3);
+            for (int i = 0; i < triangles.Length; i += 3)
+            {
+                if (removed.Contains(i))
+                    continue;
+                newTriangles.Add(triangles[i]);
+                newTriangles.Add(triangles[i + 1]);
+                newTriangles.Add(triangles[i + 2]);
+            }
+
+            if (newTriangles.Count != triangles.Length)
+                removedAny = true;
+
+            perSubmeshResults[subMesh] = newTriangles;
         }
 
-        if (newTriangles.Count == triangles.Length)
+        if (!removedAny)
             return null;
 
         var newMesh = UnityEngine.Object.Instantiate(mesh);
-        newMesh.triangles = newTriangles.ToArray();
+        newMesh.subMeshCount = subMeshCount;
+        for (int subMesh = 0; subMesh < subMeshCount; subMesh++)
+            newMesh.SetTriangles(perSubmeshResults[subMesh], subMesh);
+
         newMesh.RecalculateBounds();
         if (mesh.normals != null && mesh.normals.Length > 0)
             newMesh.RecalculateNormals();
