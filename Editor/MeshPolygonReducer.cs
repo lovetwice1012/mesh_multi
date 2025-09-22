@@ -69,6 +69,8 @@ public static class MeshPolygonReducer
         }
 
         int total = targetRenderers.Count;
+        bool assetCreated = false;
+        bool anyRendererModified = false;
         for (int i = 0; i < total; i++)
         {
             var renderer = targetRenderers[i];
@@ -100,7 +102,7 @@ public static class MeshPolygonReducer
                 var name = Path.GetFileNameWithoutExtension(meshPath) + "_reduced.asset";
                 var newPath = AssetDatabase.GenerateUniqueAssetPath(Path.Combine(directory, name));
                 AssetDatabase.CreateAsset(newMesh, newPath);
-                AssetDatabase.SaveAssets();
+                assetCreated = true;
                 renderer.sharedMesh = AssetDatabase.LoadAssetAtPath<Mesh>(newPath);
             }
             else
@@ -111,10 +113,21 @@ public static class MeshPolygonReducer
             EditorUtility.SetDirty(renderer);
             if (renderer.sharedMesh != null)
                 EditorUtility.SetDirty(renderer.sharedMesh);
+            PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
             EditorSceneManager.MarkSceneDirty(renderer.gameObject.scene);
+            anyRendererModified = true;
         }
 
         EditorUtility.ClearProgressBar();
+
+        if (assetCreated)
+        {
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+        }
+
+        if (anyRendererModified)
+            SceneView.RepaintAll();
 
         float finalPercent = Mathf.Floor(100f * 1000f) / 1000f;
         Debug.Log(string.Format("Reduced polygons for {0} meshes under '{1}' ({2:F3}%).", targetRenderers.Count, selected.name, finalPercent));
