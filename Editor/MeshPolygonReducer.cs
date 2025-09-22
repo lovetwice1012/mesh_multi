@@ -177,7 +177,7 @@ public static class MeshPolygonReducer
 
         return simplifierResult.Value.Mesh;
     }
-
+}
 
 public class MeshPolygonReducerWindow : EditorWindow
 {
