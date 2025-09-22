@@ -148,412 +148,824 @@ public static class MeshPolygonReducer
         if (desiredCandidateVertices >= candidateVertices)
             return null;
 
-        var clusterResult = BuildClusteredMesh(mesh, vertexMask, desiredCandidateVertices);
-        if (clusterResult == null)
+        var simplifier = new ArapMeshSimplifier(mesh, vertexMask);
+        var simplifierResult = simplifier.Simplify(desiredCandidateVertices);
+        if (!simplifierResult.HasValue)
             return null;
 
-        var newMesh = clusterResult.Value.NewMesh;
-        bool removedAnyTriangles = clusterResult.Value.RemovedTriangle;
-        if (!removedAnyTriangles)
+        if (!simplifierResult.Value.RemovedTriangles)
             return null;
 
-        return newMesh;
+        return simplifierResult.Value.Mesh;
     }
 
-    private static ClusterBuildResult? BuildClusteredMesh(Mesh mesh, bool[] vertexMask, int desiredCandidateVertices)
+    private class ArapMeshSimplifier
     {
-        var vertices = mesh.vertices;
-        int vertexCount = vertices.Length;
+        private const float LengthTolerance = 1e-6f;
+        private const float RelaxationStep = 0.35f;
+        private const int RelaxationIterations = 6;
 
-        Bounds bounds = CalculateBounds(vertices, vertexMask);
-        Vector3 boundsSize = bounds.size;
-        if (boundsSize.x < 1e-5f) boundsSize.x = 1e-5f;
-        if (boundsSize.y < 1e-5f) boundsSize.y = 1e-5f;
-        if (boundsSize.z < 1e-5f) boundsSize.z = 1e-5f;
+        private readonly Mesh sourceMesh;
+        private readonly bool[] vertexMask;
 
-        int desiredClusters = Mathf.Clamp(desiredCandidateVertices, 3, vertexCount);
-        float approxCells = Mathf.Pow(desiredClusters, 1f / 3f);
-        Vector3 baseCellSize = new Vector3(
-            boundsSize.x / Mathf.Max(1f, approxCells),
-            boundsSize.y / Mathf.Max(1f, approxCells),
-            boundsSize.z / Mathf.Max(1f, approxCells));
-        baseCellSize.x = Mathf.Max(baseCellSize.x, 1e-5f);
-        baseCellSize.y = Mathf.Max(baseCellSize.y, 1e-5f);
-        baseCellSize.z = Mathf.Max(baseCellSize.z, 1e-5f);
+        private readonly Vector3[] sourceVertices;
+        private readonly Vector3[] sourceNormals;
+        private readonly Vector4[] sourceTangents;
+        private readonly Color[] sourceColors;
+        private readonly BoneWeight[] sourceBoneWeights;
+        private readonly Vector2[][] sourceUVs;
 
-        ClusterBuildResult? bestResult = null;
-        float bestDifference = float.MaxValue;
-        float scale = 1f;
+        private VertexData[] vertices;
+        private List<Triangle>[] submeshTriangles;
+        private Dictionary<EdgeKey, float> restLengths;
+        private int activeVertexCount;
 
-        for (int iteration = 0; iteration < 12; iteration++)
+        public struct Result
         {
-            Vector3 cellSize = new Vector3(
-                Mathf.Max(baseCellSize.x * scale, 1e-5f),
-                Mathf.Max(baseCellSize.y * scale, 1e-5f),
-                Mathf.Max(baseCellSize.z * scale, 1e-5f));
-            var result = GenerateClusters(mesh, vertexMask, cellSize);
-            int clusterCount = result.ClusterCount;
-            float difference = Mathf.Abs(clusterCount - desiredClusters);
-            if (difference < bestDifference)
-            {
-                bestDifference = difference;
-                bestResult = result;
-            }
-
-            if (clusterCount > desiredClusters)
-                scale *= 1.3f;
-            else if (clusterCount < desiredClusters)
-                scale *= 0.7f;
-            else
-                break;
+            public Mesh Mesh;
+            public bool RemovedTriangles;
         }
 
-        if (!bestResult.HasValue)
-            return null;
-
-        return bestResult;
-    }
-
-    private static ClusterBuildResult GenerateClusters(Mesh mesh, bool[] vertexMask, Vector3 cellSize)
-    {
-        var vertices = mesh.vertices;
-        var normals = mesh.normals;
-        var tangents = mesh.tangents;
-        var colors = mesh.colors;
-        var boneWeights = mesh.boneWeights;
-        var bindposes = mesh.bindposes;
-
-        Vector2[][] uvChannels = GetUVChannels(mesh);
-
-        int vertexCount = vertices.Length;
-        Bounds bounds = CalculateBounds(vertices, vertexMask);
-        Vector3 min = bounds.min;
-
-        var clusters = new List<ClusterData>();
-        var clusterLookup = new Dictionary<ClusterKey, int>();
-        var vertexToCluster = new int[vertexCount];
-
-        bool useMask = vertexMask != null && vertexMask.Length == vertexCount;
-
-        for (int i = 0; i < vertexCount; i++)
+        private class VertexData
         {
-            bool reduce = !useMask || vertexMask[i];
-            ClusterData data;
-            int clusterIndex;
-            if (!reduce)
-            {
-                data = new ClusterData();
-                data.AddVertex(i, vertices, normals, tangents, colors, uvChannels, boneWeights);
-                clusters.Add(data);
-                clusterIndex = clusters.Count - 1;
-                vertexToCluster[i] = clusterIndex;
-                continue;
-            }
-
-            ClusterKey key = new ClusterKey(vertices[i], min, cellSize);
-            if (!clusterLookup.TryGetValue(key, out clusterIndex))
-            {
-                clusterIndex = clusters.Count;
-                clusterLookup.Add(key, clusterIndex);
-                data = new ClusterData();
-                clusters.Add(data);
-            }
-            data = clusters[clusterIndex];
-            data.AddVertex(i, vertices, normals, tangents, colors, uvChannels, boneWeights);
-            clusters[clusterIndex] = data;
-            vertexToCluster[i] = clusterIndex;
+            public Vector3 Position;
+            public Vector3 RestPosition;
+            public Vector3 NormalSum;
+            public Vector4 TangentSum;
+            public Color ColorSum;
+            public Vector2[] UVSum;
+            public bool[] UVHasData;
+            public Dictionary<int, float> BoneWeights;
+            public HashSet<int> Neighbors = new HashSet<int>();
+            public int Count;
+            public bool Locked;
+            public bool Removed;
+            public List<int> SourceIndices = new List<int>();
         }
 
-        int clusterCount = clusters.Count;
-        var newVertices = new Vector3[clusterCount];
-        Vector3[] newNormals = normals != null && normals.Length == vertexCount ? new Vector3[clusterCount] : null;
-        Vector4[] newTangents = tangents != null && tangents.Length == vertexCount ? new Vector4[clusterCount] : null;
-        Color[] newColors = colors != null && colors.Length == vertexCount ? new Color[clusterCount] : null;
-        BoneWeight[] newBoneWeights = boneWeights != null && boneWeights.Length == vertexCount ? new BoneWeight[clusterCount] : null;
-        List<Vector2>[] newUVs = new List<Vector2>[uvChannels.Length];
-        for (int channel = 0; channel < uvChannels.Length; channel++)
+        private struct Triangle
         {
-            if (uvChannels[channel] != null && uvChannels[channel].Length == vertexCount)
-                newUVs[channel] = new List<Vector2>(clusterCount);
+            public int A;
+            public int B;
+            public int C;
+            public bool Removed;
         }
 
-        for (int clusterIndex = 0; clusterIndex < clusterCount; clusterIndex++)
+        private readonly struct EdgeKey : IEquatable<EdgeKey>
         {
-            var cluster = clusters[clusterIndex];
-            newVertices[clusterIndex] = cluster.GetAveragePosition();
-            if (newNormals != null)
-                newNormals[clusterIndex] = cluster.GetAverageNormal();
-            if (newTangents != null)
-                newTangents[clusterIndex] = cluster.GetAverageTangent();
-            if (newColors != null)
-                newColors[clusterIndex] = cluster.GetAverageColor();
-            if (newBoneWeights != null)
-                newBoneWeights[clusterIndex] = cluster.GetAverageBoneWeight();
-            for (int channel = 0; channel < uvChannels.Length; channel++)
+            public readonly int A;
+            public readonly int B;
+
+            public EdgeKey(int a, int b)
             {
-                if (newUVs[channel] != null)
-                    newUVs[channel].Add(cluster.GetAverageUV(channel));
-            }
-        }
-
-        var newMesh = new Mesh();
-        newMesh.name = mesh.name;
-        newMesh.indexFormat = clusterCount > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
-        newMesh.vertices = newVertices;
-        if (newNormals != null)
-            newMesh.normals = newNormals;
-        if (newTangents != null)
-            newMesh.tangents = newTangents;
-        if (newColors != null)
-            newMesh.colors = newColors;
-        if (newBoneWeights != null)
-            newMesh.boneWeights = newBoneWeights;
-        if (bindposes != null && bindposes.Length > 0)
-            newMesh.bindposes = bindposes;
-
-        for (int channel = 0; channel < uvChannels.Length; channel++)
-        {
-            if (newUVs[channel] != null)
-                newMesh.SetUVs(channel, newUVs[channel]);
-        }
-
-        int originalSubMeshCount = mesh.subMeshCount;
-        int subMeshCount = Mathf.Max(1, originalSubMeshCount);
-        newMesh.subMeshCount = subMeshCount;
-        bool removedAnyTriangle = false;
-        for (int subMesh = 0; subMesh < subMeshCount; subMesh++)
-        {
-            int[] triangles = originalSubMeshCount == 0 && subMesh == 0 ? mesh.triangles : mesh.GetTriangles(subMesh);
-            var newTriangles = new List<int>(triangles.Length);
-            for (int t = 0; t < triangles.Length; t += 3)
-            {
-                int a = vertexToCluster[triangles[t]];
-                int b = vertexToCluster[triangles[t + 1]];
-                int c = vertexToCluster[triangles[t + 2]];
-                if (a == b || b == c || c == a)
+                if (a < b)
                 {
+                    A = a;
+                    B = b;
+                }
+                else
+                {
+                    A = b;
+                    B = a;
+                }
+            }
+
+            public bool Equals(EdgeKey other)
+            {
+                return A == other.A && B == other.B;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is EdgeKey other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                unchecked
+                {
+                    return (A * 397) ^ B;
+                }
+            }
+        }
+
+        public ArapMeshSimplifier(Mesh mesh, bool[] mask)
+        {
+            sourceMesh = mesh;
+            vertexMask = mask;
+
+            sourceVertices = mesh.vertices;
+            sourceNormals = mesh.normals;
+            sourceTangents = mesh.tangents;
+            sourceColors = mesh.colors;
+            sourceBoneWeights = mesh.boneWeights;
+            sourceUVs = GetUVChannels(mesh);
+        }
+
+        public Result? Simplify(int targetVertexCount)
+        {
+            InitializeData();
+
+            if (targetVertexCount < 3)
+                targetVertexCount = 3;
+
+            if (targetVertexCount >= activeVertexCount)
+                return null;
+
+            bool removedAnyTriangle = false;
+
+            while (activeVertexCount > targetVertexCount)
+            {
+                var bestEdge = FindBestEdge();
+                if (!bestEdge.HasValue)
+                    break;
+
+                if (CollapseEdge(bestEdge.Value.A, bestEdge.Value.B))
+                {
+                    activeVertexCount--;
                     removedAnyTriangle = true;
+                }
+                else
+                {
+                    // Unable to collapse this edge safely. Remove it from consideration.
+                    RemoveEdge(bestEdge.Value.A, bestEdge.Value.B);
                     continue;
                 }
-                newTriangles.Add(a);
-                newTriangles.Add(b);
-                newTriangles.Add(c);
             }
-            newMesh.SetTriangles(newTriangles, subMesh);
-            if (newTriangles.Count == 0)
-                removedAnyTriangle = true;
+
+            if (!removedAnyTriangle)
+                return null;
+
+            RunArapRelaxation();
+
+            var mesh = BuildMesh(out bool removedTrianglesDuringBuild);
+            removedAnyTriangle |= removedTrianglesDuringBuild;
+
+            return new Result
+            {
+                Mesh = mesh,
+                RemovedTriangles = removedAnyTriangle
+            };
         }
 
-        CopyBlendShapes(mesh, newMesh, clusters, vertexToCluster);
-
-        newMesh.RecalculateBounds();
-        if ((mesh.normals == null || mesh.normals.Length == 0) && newMesh.normals == null)
-            newMesh.RecalculateNormals();
-        if ((mesh.tangents == null || mesh.tangents.Length == 0) && newMesh.tangents == null)
-            newMesh.RecalculateTangents();
-
-        bool anyReduction = removedAnyTriangle || clusterCount != vertexCount;
-
-        return new ClusterBuildResult
+        private void InitializeData()
         {
-            ClusterCount = clusterCount,
-            NewMesh = newMesh,
-            RemovedTriangle = anyReduction
-        };
-    }
+            int vertexCount = sourceVertices.Length;
+            vertices = new VertexData[vertexCount];
+            activeVertexCount = vertexCount;
 
-    private static void CopyBlendShapes(Mesh originalMesh, Mesh newMesh, List<ClusterData> clusters, int[] vertexToCluster)
-    {
-        int blendShapeCount = originalMesh.blendShapeCount;
-        if (blendShapeCount == 0)
-            return;
-
-        var clusterCounts = new int[clusters.Count];
-        for (int i = 0; i < vertexToCluster.Length; i++)
-            clusterCounts[vertexToCluster[i]]++;
-
-        var deltaVertices = new Vector3[originalMesh.vertexCount];
-        var deltaNormals = new Vector3[originalMesh.vertexCount];
-        var deltaTangents = new Vector3[originalMesh.vertexCount];
-
-        for (int shapeIndex = 0; shapeIndex < blendShapeCount; shapeIndex++)
-        {
-            string shapeName = originalMesh.GetBlendShapeName(shapeIndex);
-            int frameCount = originalMesh.GetBlendShapeFrameCount(shapeIndex);
-            for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
+            for (int i = 0; i < vertexCount; i++)
             {
-                float weight = originalMesh.GetBlendShapeFrameWeight(shapeIndex, frameIndex);
-                originalMesh.GetBlendShapeFrameVertices(shapeIndex, frameIndex, deltaVertices, deltaNormals, deltaTangents);
-
-                var newDeltaVertices = new Vector3[clusters.Count];
-                var newDeltaNormals = new Vector3[clusters.Count];
-                var newDeltaTangents = new Vector3[clusters.Count];
-
-                for (int v = 0; v < vertexToCluster.Length; v++)
-                {
-                    int clusterIndex = vertexToCluster[v];
-                    newDeltaVertices[clusterIndex] += deltaVertices[v];
-                    newDeltaNormals[clusterIndex] += deltaNormals[v];
-                    newDeltaTangents[clusterIndex] += deltaTangents[v];
-                }
-
-                for (int clusterIndex = 0; clusterIndex < clusters.Count; clusterIndex++)
-                {
-                    int count = Mathf.Max(1, clusterCounts[clusterIndex]);
-                    newDeltaVertices[clusterIndex] /= count;
-                    newDeltaNormals[clusterIndex] /= count;
-                    newDeltaTangents[clusterIndex] /= count;
-                }
-
-                newMesh.AddBlendShapeFrame(shapeName, weight, newDeltaVertices, newDeltaNormals, newDeltaTangents);
+                vertices[i] = CreateVertexData(i);
             }
-        }
-    }
 
-    private struct ClusterKey : IEquatable<ClusterKey>
-    {
-        private readonly int x;
-        private readonly int y;
-        private readonly int z;
-
-        public ClusterKey(Vector3 position, Vector3 min, Vector3 cellSize)
-        {
-            x = Mathf.FloorToInt((position.x - min.x) / cellSize.x);
-            y = Mathf.FloorToInt((position.y - min.y) / cellSize.y);
-            z = Mathf.FloorToInt((position.z - min.z) / cellSize.z);
-        }
-
-        public bool Equals(ClusterKey other)
-        {
-            return x == other.x && y == other.y && z == other.z;
-        }
-
-        public override bool Equals(object obj)
-        {
-            return obj is ClusterKey other && Equals(other);
-        }
-
-        public override int GetHashCode()
-        {
-            unchecked
+            int subMeshCount = Mathf.Max(1, sourceMesh.subMeshCount);
+            submeshTriangles = new List<Triangle>[subMeshCount];
+            for (int sub = 0; sub < subMeshCount; sub++)
             {
-                int hash = x;
-                hash = (hash * 397) ^ y;
-                hash = (hash * 397) ^ z;
-                return hash;
-            }
-        }
-    }
-
-    private struct ClusterData
-    {
-        private Vector3 positionSum;
-        private Vector3 normalSum;
-        private Vector4 tangentSum;
-        private Color colorSum;
-        private int count;
-        private Dictionary<int, float> boneWeights;
-        private Vector2[] uvSum;
-        private bool[] uvHasData;
-
-        public void AddVertex(int index, Vector3[] vertices, Vector3[] normals, Vector4[] tangents, Color[] colors, Vector2[][] uvChannels, BoneWeight[] boneWeightArray)
-        {
-            positionSum += vertices[index];
-            if (normals != null && normals.Length == vertices.Length)
-                normalSum += normals[index];
-            if (tangents != null && tangents.Length == vertices.Length)
-                tangentSum += tangents[index];
-            if (colors != null && colors.Length == vertices.Length)
-                colorSum += colors[index];
-
-            if (uvChannels != null)
-            {
-                if (uvSum == null)
+                submeshTriangles[sub] = new List<Triangle>();
+                int[] tris = sourceMesh.subMeshCount == 0 && sub == 0 ? sourceMesh.triangles : sourceMesh.GetTriangles(sub);
+                for (int i = 0; i < tris.Length; i += 3)
                 {
-                    uvSum = new Vector2[uvChannels.Length];
-                    uvHasData = new bool[uvChannels.Length];
-                }
-                for (int channel = 0; channel < uvChannels.Length; channel++)
-                {
-                    var channelData = uvChannels[channel];
-                    if (channelData != null && channelData.Length == vertices.Length)
+                    var tri = new Triangle
                     {
-                        uvSum[channel] += channelData[index];
-                        uvHasData[channel] = true;
+                        A = tris[i],
+                        B = tris[i + 1],
+                        C = tris[i + 2],
+                        Removed = false
+                    };
+                    submeshTriangles[sub].Add(tri);
+                    AddNeighbor(tri.A, tri.B);
+                    AddNeighbor(tri.B, tri.C);
+                    AddNeighbor(tri.C, tri.A);
+                }
+            }
+
+            restLengths = new Dictionary<EdgeKey, float>();
+            for (int i = 0; i < vertexCount; i++)
+            {
+                foreach (var neighbor in vertices[i].Neighbors)
+                {
+                    EdgeKey key = new EdgeKey(i, neighbor);
+                    if (!restLengths.ContainsKey(key))
+                    {
+                        float length = (sourceVertices[key.A] - sourceVertices[key.B]).magnitude;
+                        restLengths.Add(key, Mathf.Max(length, LengthTolerance));
+                    }
+                }
+            }
+        }
+
+        private VertexData CreateVertexData(int index)
+        {
+            var data = new VertexData
+            {
+                Position = sourceVertices[index],
+                RestPosition = sourceVertices[index],
+                Count = 1,
+                Locked = vertexMask != null && vertexMask.Length == sourceVertices.Length && !vertexMask[index],
+                UVSum = new Vector2[sourceUVs.Length],
+                UVHasData = new bool[sourceUVs.Length]
+            };
+
+            data.SourceIndices.Add(index);
+
+            if (sourceNormals != null && sourceNormals.Length == sourceVertices.Length)
+                data.NormalSum = sourceNormals[index];
+            if (sourceTangents != null && sourceTangents.Length == sourceVertices.Length)
+                data.TangentSum = sourceTangents[index];
+            if (sourceColors != null && sourceColors.Length == sourceVertices.Length)
+                data.ColorSum = sourceColors[index];
+
+            for (int channel = 0; channel < sourceUVs.Length; channel++)
+            {
+                var uvChannel = sourceUVs[channel];
+                if (uvChannel != null && uvChannel.Length == sourceVertices.Length)
+                {
+                    data.UVSum[channel] = uvChannel[index];
+                    data.UVHasData[channel] = true;
+                }
+            }
+
+            if (sourceBoneWeights != null && sourceBoneWeights.Length == sourceVertices.Length)
+            {
+                data.BoneWeights = new Dictionary<int, float>(4);
+                AddBoneWeight(data.BoneWeights, sourceBoneWeights[index].boneIndex0, sourceBoneWeights[index].weight0);
+                AddBoneWeight(data.BoneWeights, sourceBoneWeights[index].boneIndex1, sourceBoneWeights[index].weight1);
+                AddBoneWeight(data.BoneWeights, sourceBoneWeights[index].boneIndex2, sourceBoneWeights[index].weight2);
+                AddBoneWeight(data.BoneWeights, sourceBoneWeights[index].boneIndex3, sourceBoneWeights[index].weight3);
+            }
+
+            return data;
+        }
+
+        private void AddNeighbor(int a, int b)
+        {
+            if (a == b)
+                return;
+            vertices[a].Neighbors.Add(b);
+            vertices[b].Neighbors.Add(a);
+        }
+
+        private static void AddBoneWeight(Dictionary<int, float> dict, int index, float weight)
+        {
+            if (weight <= 0f)
+                return;
+            if (!dict.ContainsKey(index))
+                dict[index] = weight;
+            else
+                dict[index] += weight;
+        }
+
+        private EdgeKey? FindBestEdge()
+        {
+            float bestCost = float.MaxValue;
+            EdgeKey? bestEdge = null;
+
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                if (vertices[i] == null || vertices[i].Removed)
+                    continue;
+
+                foreach (var neighbor in vertices[i].Neighbors)
+                {
+                    if (neighbor <= i)
+                        continue;
+                    if (vertices[neighbor] == null || vertices[neighbor].Removed)
+                        continue;
+
+                    float cost = ComputeEdgeCost(i, neighbor);
+                    if (cost < bestCost)
+                    {
+                        bestCost = cost;
+                        bestEdge = new EdgeKey(i, neighbor);
                     }
                 }
             }
 
-            if (boneWeightArray != null && boneWeightArray.Length == vertices.Length)
-            {
-                if (boneWeights == null)
-                    boneWeights = new Dictionary<int, float>();
+            return bestEdge;
+        }
 
-                AddBoneWeight(boneWeightArray[index].boneIndex0, boneWeightArray[index].weight0);
-                AddBoneWeight(boneWeightArray[index].boneIndex1, boneWeightArray[index].weight1);
-                AddBoneWeight(boneWeightArray[index].boneIndex2, boneWeightArray[index].weight2);
-                AddBoneWeight(boneWeightArray[index].boneIndex3, boneWeightArray[index].weight3);
+        private float ComputeEdgeCost(int a, int b)
+        {
+            var va = vertices[a];
+            var vb = vertices[b];
+            if (va.Locked && vb.Locked)
+                return float.MaxValue;
+
+            HashSet<int> union = new HashSet<int>(va.Neighbors);
+            union.UnionWith(vb.Neighbors);
+            union.Remove(a);
+            union.Remove(b);
+
+            if (union.Count == 0)
+                return float.MaxValue;
+
+            Vector3 merged = EstimateMergedPosition(a, b);
+            float cost = 0f;
+            foreach (int n in union)
+            {
+                float rest = GetCombinedRestLength(a, b, n);
+                Vector3 dir = vertices[n].Position - merged;
+                float length = dir.magnitude;
+                if (rest <= 0f)
+                    rest = Mathf.Max(length, LengthTolerance);
+                float diff = length - rest;
+                cost += diff * diff;
             }
 
-            count++;
+            cost /= union.Count;
+            return cost;
         }
 
-        private void AddBoneWeight(int boneIndex, float weight)
+        private Vector3 EstimateMergedPosition(int a, int b)
         {
-            if (weight <= 0f)
+            var va = vertices[a];
+            var vb = vertices[b];
+            Vector3 merged = (va.Position * va.Count + vb.Position * vb.Count) / Mathf.Max(1, va.Count + vb.Count);
+
+            HashSet<int> union = new HashSet<int>(va.Neighbors);
+            union.UnionWith(vb.Neighbors);
+            union.Remove(a);
+            union.Remove(b);
+
+            Vector3 correction = Vector3.zero;
+            float weight = 0f;
+            foreach (int n in union)
+            {
+                float rest = GetCombinedRestLength(a, b, n);
+                Vector3 neighborPos = vertices[n].Position;
+                Vector3 dir = neighborPos - merged;
+                float len = dir.magnitude;
+                if (len <= LengthTolerance || rest <= 0f)
+                    continue;
+                float diff = rest - len;
+                correction += dir.normalized * diff;
+                weight += 1f;
+            }
+
+            if (weight > 0f)
+                merged += correction / weight * 0.5f;
+
+            return merged;
+        }
+
+        private float GetCombinedRestLength(int a, int b, int neighbor)
+        {
+            float restA = GetRestLength(a, neighbor);
+            float restB = GetRestLength(b, neighbor);
+            var va = vertices[a];
+            var vb = vertices[b];
+
+            if (restA > 0f && restB > 0f)
+                return (restA * va.Count + restB * vb.Count) / Mathf.Max(1, va.Count + vb.Count);
+            if (restA > 0f)
+                return restA;
+            if (restB > 0f)
+                return restB;
+            return 0f;
+        }
+
+        private float GetRestLength(int a, int b)
+        {
+            EdgeKey key = new EdgeKey(a, b);
+            if (restLengths.TryGetValue(key, out float length))
+                return length;
+            return 0f;
+        }
+
+        private bool CollapseEdge(int a, int b)
+        {
+            var va = vertices[a];
+            var vb = vertices[b];
+            if (va == null || vb == null || va.Removed || vb.Removed)
+                return false;
+            if (va.Locked && vb.Locked)
+                return false;
+
+            int target = va.Locked ? a : (vb.Locked ? b : a);
+            int source = target == a ? b : a;
+
+            if (target != a)
+            {
+                int temp = a;
+                a = b;
+                b = temp;
+                va = vertices[a];
+                vb = vertices[b];
+            }
+
+            Vector3 mergedPosition = EstimateMergedPosition(a, b);
+
+            MergeVertexData(a, b, mergedPosition);
+            UpdateTrianglesAfterMerge(a, b);
+            UpdateNeighborsAfterMerge(a, b);
+            UpdateRestLengthsAfterMerge(a, b);
+
+            vb.Removed = true;
+            vb.Neighbors.Clear();
+
+            return true;
+        }
+
+        private void MergeVertexData(int target, int source, Vector3 newPosition)
+        {
+            var vt = vertices[target];
+            var vs = vertices[source];
+
+            int combinedCount = Mathf.Max(1, vt.Count + vs.Count);
+            vt.Position = newPosition;
+            vt.RestPosition = (vt.RestPosition * vt.Count + vs.RestPosition * vs.Count) / combinedCount;
+            vt.Count = combinedCount;
+            vt.Locked = vt.Locked || vs.Locked;
+
+            vt.NormalSum += vs.NormalSum;
+            vt.TangentSum += vs.TangentSum;
+            vt.ColorSum += vs.ColorSum;
+            vt.SourceIndices.AddRange(vs.SourceIndices);
+
+            for (int channel = 0; channel < vt.UVSum.Length; channel++)
+            {
+                if (vs.UVHasData[channel])
+                {
+                    vt.UVSum[channel] += vs.UVSum[channel];
+                    vt.UVHasData[channel] = true;
+                }
+            }
+
+            if (vs.BoneWeights != null)
+            {
+                if (vt.BoneWeights == null)
+                    vt.BoneWeights = new Dictionary<int, float>(vs.BoneWeights.Count);
+                foreach (var kv in vs.BoneWeights)
+                {
+                    if (vt.BoneWeights.ContainsKey(kv.Key))
+                        vt.BoneWeights[kv.Key] += kv.Value;
+                    else
+                        vt.BoneWeights.Add(kv.Key, kv.Value);
+                }
+            }
+        }
+
+        private void UpdateTrianglesAfterMerge(int target, int source)
+        {
+            for (int sub = 0; sub < submeshTriangles.Length; sub++)
+            {
+                var list = submeshTriangles[sub];
+                for (int i = 0; i < list.Count; i++)
+                {
+                    var tri = list[i];
+                    if (tri.Removed)
+                        continue;
+
+                    bool changed = false;
+                    if (tri.A == source)
+                    {
+                        tri.A = target;
+                        changed = true;
+                    }
+                    if (tri.B == source)
+                    {
+                        tri.B = target;
+                        changed = true;
+                    }
+                    if (tri.C == source)
+                    {
+                        tri.C = target;
+                        changed = true;
+                    }
+
+                    if (tri.A == tri.B || tri.B == tri.C || tri.C == tri.A)
+                    {
+                        tri.Removed = true;
+                        list[i] = tri;
+                        continue;
+                    }
+
+                    if (changed)
+                        list[i] = tri;
+                }
+            }
+        }
+
+        private void UpdateNeighborsAfterMerge(int target, int source)
+        {
+            var vt = vertices[target];
+            var vs = vertices[source];
+
+            vt.Neighbors.Remove(target);
+            vt.Neighbors.Remove(source);
+
+            foreach (var neighbor in vs.Neighbors)
+            {
+                if (neighbor == target)
+                    continue;
+
+                vt.Neighbors.Add(neighbor);
+                var vn = vertices[neighbor];
+                vn.Neighbors.Remove(source);
+                vn.Neighbors.Add(target);
+            }
+        }
+
+        private void UpdateRestLengthsAfterMerge(int target, int source)
+        {
+            var vt = vertices[target];
+            var vs = vertices[source];
+
+            foreach (var neighbor in vs.Neighbors)
+            {
+                EdgeKey keySource = new EdgeKey(source, neighbor);
+                if (!restLengths.TryGetValue(keySource, out float sourceRest))
+                    sourceRest = (vertices[source].RestPosition - vertices[neighbor].RestPosition).magnitude;
+
+                EdgeKey keyTarget = new EdgeKey(target, neighbor);
+                float targetRest = 0f;
+                restLengths.TryGetValue(keyTarget, out targetRest);
+
+                float combined = sourceRest;
+                if (targetRest > 0f)
+                {
+                    combined = (targetRest * vt.Count + sourceRest * vs.Count) / Mathf.Max(1, vt.Count + vs.Count);
+                }
+
+                restLengths[keyTarget] = Mathf.Max(combined, LengthTolerance);
+                restLengths.Remove(keySource);
+            }
+
+            EdgeKey collapsed = new EdgeKey(target, source);
+            restLengths.Remove(collapsed);
+        }
+
+        private void RemoveEdge(int a, int b)
+        {
+            vertices[a].Neighbors.Remove(b);
+            vertices[b].Neighbors.Remove(a);
+            EdgeKey key = new EdgeKey(a, b);
+            restLengths.Remove(key);
+        }
+
+        private void RunArapRelaxation()
+        {
+            for (int iteration = 0; iteration < RelaxationIterations; iteration++)
+            {
+                Vector3[] updated = new Vector3[vertices.Length];
+                for (int i = 0; i < vertices.Length; i++)
+                {
+                    var v = vertices[i];
+                    if (v == null || v.Removed)
+                        continue;
+                    if (v.Locked)
+                    {
+                        updated[i] = v.Position;
+                        continue;
+                    }
+
+                    Vector3 delta = Vector3.zero;
+                    float totalWeight = 0f;
+                    foreach (var neighbor in v.Neighbors)
+                    {
+                        var n = vertices[neighbor];
+                        if (n == null || n.Removed)
+                            continue;
+
+                        float rest = GetRestLength(i, neighbor);
+                        Vector3 dir = v.Position - n.Position;
+                        float length = dir.magnitude;
+                        if (length <= LengthTolerance || rest <= 0f)
+                            continue;
+
+                        float factor = 1f - (rest / length);
+                        delta += dir * factor;
+                        totalWeight += 1f;
+                    }
+
+                    if (totalWeight > 0f)
+                        updated[i] = v.Position - (delta / totalWeight) * RelaxationStep;
+                    else
+                        updated[i] = v.Position;
+                }
+
+                for (int i = 0; i < vertices.Length; i++)
+                {
+                    if (vertices[i] == null || vertices[i].Removed || vertices[i].Locked)
+                        continue;
+                    vertices[i].Position = updated[i];
+                }
+            }
+        }
+
+        private Mesh BuildMesh(out bool removedAnyTriangle)
+        {
+            removedAnyTriangle = false;
+            var mesh = new Mesh();
+            mesh.name = sourceMesh.name;
+
+            int vertexCount = 0;
+            int[] map = new int[vertices.Length];
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var v = vertices[i];
+                if (v == null || v.Removed)
+                {
+                    map[i] = -1;
+                    continue;
+                }
+                map[i] = vertexCount++;
+            }
+
+            var newVertices = new Vector3[vertexCount];
+            Vector3[] newNormals = (sourceNormals != null && sourceNormals.Length == sourceVertices.Length) ? new Vector3[vertexCount] : null;
+            Vector4[] newTangents = (sourceTangents != null && sourceTangents.Length == sourceVertices.Length) ? new Vector4[vertexCount] : null;
+            Color[] newColors = (sourceColors != null && sourceColors.Length == sourceVertices.Length) ? new Color[vertexCount] : null;
+            BoneWeight[] newBoneWeights = (sourceBoneWeights != null && sourceBoneWeights.Length == sourceVertices.Length) ? new BoneWeight[vertexCount] : null;
+            List<int>[] vertexSources = new List<int>[vertexCount];
+
+            List<Vector2>[] uvChannels = new List<Vector2>[sourceUVs.Length];
+            for (int channel = 0; channel < sourceUVs.Length; channel++)
+            {
+                if (sourceUVs[channel] != null && sourceUVs[channel].Length == sourceVertices.Length)
+                    uvChannels[channel] = new List<Vector2>(vertexCount);
+            }
+
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var v = vertices[i];
+                if (v == null || v.Removed)
+                    continue;
+                int mapped = map[i];
+
+                newVertices[mapped] = v.Position;
+
+                if (newNormals != null)
+                {
+                    Vector3 normal = v.NormalSum / Mathf.Max(1, v.Count);
+                    newNormals[mapped] = normal.sqrMagnitude > 0f ? normal.normalized : normal;
+                }
+
+                if (newTangents != null)
+                {
+                    Vector4 tangent = v.TangentSum / Mathf.Max(1, v.Count);
+                    Vector3 xyz = new Vector3(tangent.x, tangent.y, tangent.z);
+                    if (xyz.sqrMagnitude > 0f)
+                        xyz.Normalize();
+                    float w = tangent.w >= 0f ? 1f : -1f;
+                    newTangents[mapped] = new Vector4(xyz.x, xyz.y, xyz.z, w);
+                }
+
+                if (newColors != null)
+                {
+                    newColors[mapped] = v.ColorSum / Mathf.Max(1, v.Count);
+                }
+
+                if (newBoneWeights != null)
+                {
+                    newBoneWeights[mapped] = BuildBoneWeight(v.BoneWeights);
+                }
+
+                vertexSources[mapped] = v.SourceIndices;
+
+                for (int channel = 0; channel < uvChannels.Length; channel++)
+                {
+                    if (uvChannels[channel] == null)
+                        continue;
+                    Vector2 uv = Vector2.zero;
+                    if (v.UVHasData[channel])
+                        uv = v.UVSum[channel] / Mathf.Max(1, v.Count);
+                    uvChannels[channel].Add(uv);
+                }
+            }
+
+            mesh.indexFormat = vertexCount > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
+            mesh.vertices = newVertices;
+            if (newNormals != null)
+                mesh.normals = newNormals;
+            if (newTangents != null)
+                mesh.tangents = newTangents;
+            if (newColors != null)
+                mesh.colors = newColors;
+            if (newBoneWeights != null)
+                mesh.boneWeights = newBoneWeights;
+            if (sourceMesh.bindposes != null && sourceMesh.bindposes.Length > 0)
+                mesh.bindposes = sourceMesh.bindposes;
+
+            for (int channel = 0; channel < uvChannels.Length; channel++)
+            {
+                if (uvChannels[channel] != null)
+                    mesh.SetUVs(channel, uvChannels[channel]);
+            }
+
+            CopyBlendShapesToMesh(mesh, vertexSources);
+
+            bool anyTriangles = false;
+            mesh.subMeshCount = submeshTriangles.Length;
+            for (int sub = 0; sub < submeshTriangles.Length; sub++)
+            {
+                List<int> indices = new List<int>();
+                foreach (var tri in submeshTriangles[sub])
+                {
+                    if (tri.Removed)
+                    {
+                        removedAnyTriangle = true;
+                        continue;
+                    }
+                    int a = map[tri.A];
+                    int b = map[tri.B];
+                    int c = map[tri.C];
+                    if (a < 0 || b < 0 || c < 0)
+                    {
+                        removedAnyTriangle = true;
+                        continue;
+                    }
+                    if (a == b || b == c || c == a)
+                    {
+                        removedAnyTriangle = true;
+                        continue;
+                    }
+                    indices.Add(a);
+                    indices.Add(b);
+                    indices.Add(c);
+                    anyTriangles = true;
+                }
+
+                mesh.SetTriangles(indices, sub, true);
+            }
+
+            mesh.RecalculateBounds();
+            if (mesh.normals == null || mesh.normals.Length == 0)
+                mesh.RecalculateNormals();
+            if (mesh.tangents == null || mesh.tangents.Length == 0)
+                mesh.RecalculateTangents();
+
+            if (!anyTriangles)
+                removedAnyTriangle = true;
+
+            return mesh;
+        }
+
+        private void CopyBlendShapesToMesh(Mesh mesh, List<int>[] vertexSources)
+        {
+            int blendShapeCount = sourceMesh.blendShapeCount;
+            if (blendShapeCount == 0)
                 return;
-            if (boneWeights == null)
-                boneWeights = new Dictionary<int, float>();
-            if (!boneWeights.ContainsKey(boneIndex))
-                boneWeights.Add(boneIndex, weight);
-            else
-                boneWeights[boneIndex] += weight;
+
+            var deltaVertices = new Vector3[sourceVertices.Length];
+            var deltaNormals = new Vector3[sourceVertices.Length];
+            var deltaTangents = new Vector3[sourceVertices.Length];
+
+            var newDeltaVertices = new Vector3[mesh.vertexCount];
+            var newDeltaNormals = new Vector3[mesh.vertexCount];
+            var newDeltaTangents = new Vector3[mesh.vertexCount];
+
+            for (int shapeIndex = 0; shapeIndex < blendShapeCount; shapeIndex++)
+            {
+                string shapeName = sourceMesh.GetBlendShapeName(shapeIndex);
+                int frameCount = sourceMesh.GetBlendShapeFrameCount(shapeIndex);
+                for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
+                {
+                    float weight = sourceMesh.GetBlendShapeFrameWeight(shapeIndex, frameIndex);
+                    sourceMesh.GetBlendShapeFrameVertices(shapeIndex, frameIndex, deltaVertices, deltaNormals, deltaTangents);
+
+                    Array.Clear(newDeltaVertices, 0, newDeltaVertices.Length);
+                    Array.Clear(newDeltaNormals, 0, newDeltaNormals.Length);
+                    Array.Clear(newDeltaTangents, 0, newDeltaTangents.Length);
+
+                    for (int v = 0; v < mesh.vertexCount; v++)
+                    {
+                        var sources = vertexSources[v];
+                        if (sources == null || sources.Count == 0)
+                            continue;
+
+                        Vector3 accumDelta = Vector3.zero;
+                        Vector3 accumNormal = Vector3.zero;
+                        Vector3 accumTangent = Vector3.zero;
+                        foreach (int src in sources)
+                        {
+                            accumDelta += deltaVertices[src];
+                            accumNormal += deltaNormals[src];
+                            accumTangent += deltaTangents[src];
+                        }
+
+                        float inv = 1f / Mathf.Max(1, sources.Count);
+                        newDeltaVertices[v] = accumDelta * inv;
+                        newDeltaNormals[v] = accumNormal * inv;
+                        newDeltaTangents[v] = accumTangent * inv;
+                    }
+
+                    mesh.AddBlendShapeFrame(shapeName, weight, newDeltaVertices, newDeltaNormals, newDeltaTangents);
+                }
+            }
         }
 
-        public Vector3 GetAveragePosition()
+        private static BoneWeight BuildBoneWeight(Dictionary<int, float> weights)
         {
-            return positionSum / Mathf.Max(1, count);
-        }
-
-        public Vector3 GetAverageNormal()
-        {
-            Vector3 normal = normalSum / Mathf.Max(1, count);
-            return normal == Vector3.zero ? normal : normal.normalized;
-        }
-
-        public Vector4 GetAverageTangent()
-        {
-            Vector4 tangent = tangentSum / Mathf.Max(1, count);
-            Vector3 xyz = new Vector3(tangent.x, tangent.y, tangent.z);
-            if (xyz != Vector3.zero)
-                xyz.Normalize();
-            float w = tangent.w >= 0f ? 1f : -1f;
-            return new Vector4(xyz.x, xyz.y, xyz.z, w);
-        }
-
-        public Color GetAverageColor()
-        {
-            return colorSum / Mathf.Max(1, count);
-        }
-
-        public Vector2 GetAverageUV(int channel)
-        {
-            if (uvSum == null || uvSum.Length <= channel || uvHasData == null || !uvHasData[channel])
-                return Vector2.zero;
-            return uvSum[channel] / Mathf.Max(1, count);
-        }
-
-        public BoneWeight GetAverageBoneWeight()
-        {
-            if (boneWeights == null || boneWeights.Count == 0)
+            if (weights == null || weights.Count == 0)
                 return default;
 
-            var ordered = new List<KeyValuePair<int, float>>(boneWeights.Count);
-            foreach (var kv in boneWeights)
-                ordered.Add(kv);
+            var ordered = new List<KeyValuePair<int, float>>(weights);
             ordered.Sort((a, b) => b.Value.CompareTo(a.Value));
 
-            BoneWeight result = new BoneWeight();
+            BoneWeight boneWeight = new BoneWeight();
             float total = 0f;
             int influenceCount = Mathf.Min(4, ordered.Count);
             for (int i = 0; i < influenceCount; i++)
@@ -563,36 +975,30 @@ public static class MeshPolygonReducer
 
             for (int i = 0; i < influenceCount; i++)
             {
-                float normalized = ordered[i].Value / total;
+                float value = ordered[i].Value / total;
                 switch (i)
                 {
                     case 0:
-                        result.boneIndex0 = ordered[i].Key;
-                        result.weight0 = normalized;
+                        boneWeight.boneIndex0 = ordered[i].Key;
+                        boneWeight.weight0 = value;
                         break;
                     case 1:
-                        result.boneIndex1 = ordered[i].Key;
-                        result.weight1 = normalized;
+                        boneWeight.boneIndex1 = ordered[i].Key;
+                        boneWeight.weight1 = value;
                         break;
                     case 2:
-                        result.boneIndex2 = ordered[i].Key;
-                        result.weight2 = normalized;
+                        boneWeight.boneIndex2 = ordered[i].Key;
+                        boneWeight.weight2 = value;
                         break;
                     case 3:
-                        result.boneIndex3 = ordered[i].Key;
-                        result.weight3 = normalized;
+                        boneWeight.boneIndex3 = ordered[i].Key;
+                        boneWeight.weight3 = value;
                         break;
                 }
             }
-            return result;
-        }
-    }
 
-    private struct ClusterBuildResult
-    {
-        public int ClusterCount;
-        public Mesh NewMesh;
-        public bool RemovedTriangle;
+            return boneWeight;
+        }
     }
 
     private static Bounds CalculateBounds(Vector3[] vertices, bool[] vertexMask)
