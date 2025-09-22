@@ -25,6 +25,7 @@ internal sealed class ArapMeshSimplifier
 
     private readonly Mesh sourceMesh;
     private readonly bool[] vertexMask;
+    private readonly int? randomSeed;
 
     private readonly Vector3[] sourceVertices;
     private readonly Vector3[] sourceNormals;
@@ -39,6 +40,8 @@ internal sealed class ArapMeshSimplifier
     private PriorityQueue<EdgeCandidate> edgeQueue;
     private int activeVertexCount;
     private int candidateVertexCount;
+    private System.Random random;
+    private int candidateTieBreakerCounter;
 
     private VertexData[] baseVertices;
     private List<TriangleData> baseTriangles;
@@ -142,10 +145,20 @@ internal sealed class ArapMeshSimplifier
         public Vector3 OptimalPosition;
         public int RevisionA;
         public int RevisionB;
+        public int TieBreaker;
 
         public int CompareTo(EdgeCandidate other)
         {
-            return Cost.CompareTo(other.Cost);
+            int costComparison = Cost.CompareTo(other.Cost);
+            if (costComparison != 0)
+                return costComparison;
+            int tieComparison = TieBreaker.CompareTo(other.TieBreaker);
+            if (tieComparison != 0)
+                return tieComparison;
+            int aComparison = A.CompareTo(other.A);
+            if (aComparison != 0)
+                return aComparison;
+            return B.CompareTo(other.B);
         }
     }
 
@@ -462,10 +475,22 @@ internal sealed class ArapMeshSimplifier
         public List<float> Weights = new List<float>();
     }
 
-    public ArapMeshSimplifier(Mesh mesh, bool[] mask)
+    public ArapMeshSimplifier(Mesh mesh, bool[] mask, int? seed = null)
     {
         sourceMesh = mesh;
-        vertexMask = mask;
+        if (mesh == null)
+            throw new ArgumentNullException(nameof(mesh));
+
+        if (mask != null && mask.Length != mesh.vertexCount)
+        {
+            Debug.LogWarning($"Ignoring vertex mask for '{mesh.name}' because its length ({mask.Length}) does not match the mesh vertex count ({mesh.vertexCount}).");
+            vertexMask = null;
+        }
+        else
+        {
+            vertexMask = mask;
+        }
+        randomSeed = seed;
         sourceVertices = mesh.vertices;
         sourceNormals = mesh.normals;
         sourceTangents = mesh.tangents;
@@ -508,7 +533,7 @@ internal sealed class ArapMeshSimplifier
 
         for (int i = 0; i < vertexCount; i++)
         {
-            bool candidate = vertexMask == null || (vertexMask.Length == vertexCount && vertexMask[i]);
+            bool candidate = vertexMask == null || vertexMask[i];
             baseVertices[i] = CreateInitialVertex(i, candidate);
             if (candidate)
                 baseCandidateVertexCount++;
@@ -630,6 +655,8 @@ internal sealed class ArapMeshSimplifier
 
         candidateVertexCount = baseCandidateVertexCount;
         activeVertexCount = baseActiveVertexCount;
+        candidateTieBreakerCounter = 0;
+        random = randomSeed.HasValue ? new System.Random(randomSeed.Value) : null;
     }
 
     private static VertexData CloneVertex(VertexData source)
@@ -842,7 +869,8 @@ internal sealed class ArapMeshSimplifier
             Cost = bestCost,
             OptimalPosition = bestPosition,
             RevisionA = va.Revision,
-            RevisionB = vb.Revision
+            RevisionB = vb.Revision,
+            TieBreaker = NextTieBreakerValue()
         };
         return true;
     }
@@ -1117,6 +1145,13 @@ internal sealed class ArapMeshSimplifier
         }
     }
 
+    private int NextTieBreakerValue()
+    {
+        if (random != null)
+            return random.Next();
+        return unchecked(candidateTieBreakerCounter++);
+    }
+
     private void RunArapRelaxation()
     {
         Dictionary<int, float>[] weights = BuildCotangentWeights();
@@ -1234,7 +1269,9 @@ internal sealed class ArapMeshSimplifier
     {
         if (float.IsNaN(cot) || float.IsInfinity(cot))
             return;
-        cot = Mathf.Max(cot, CotangentEpsilon);
+        float magnitude = Mathf.Abs(cot);
+        if (magnitude < CotangentEpsilon)
+            cot = (cot >= 0f ? 1f : -1f) * CotangentEpsilon;
         if (weights[i] == null)
             weights[i] = new Dictionary<int, float>();
         if (weights[j] == null)
