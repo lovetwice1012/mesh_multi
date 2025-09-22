@@ -220,10 +220,17 @@ public static class MeshPolygonReducer
             newMesh.SetTriangles(perSubmeshResults[subMesh], subMesh);
 
         newMesh.RecalculateBounds();
-        if (mesh.normals != null && mesh.normals.Length > 0)
-            newMesh.RecalculateNormals();
-        if (mesh.tangents != null && mesh.tangents.Length > 0)
-            newMesh.RecalculateTangents();
+
+        // Recalculating normals or tangents on a mesh that has blend shapes breaks the
+        // stored deltas for those shapes. The original normals/tangents are already
+        // copied by Instantiate, so only recalculate them when no blend shapes exist.
+        if (mesh.blendShapeCount == 0)
+        {
+            if (mesh.normals != null && mesh.normals.Length > 0)
+                newMesh.RecalculateNormals();
+            if (mesh.tangents != null && mesh.tangents.Length > 0)
+                newMesh.RecalculateTangents();
+        }
         return newMesh;
     }
 }
