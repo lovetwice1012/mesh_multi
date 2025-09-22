@@ -163,15 +163,24 @@ public static class MeshPolygonReducer
     private static Mesh ReduceMesh(Mesh mesh, float reductionRatio, bool[] vertexMask, int? seed)
     {
         if (mesh == null)
+        {
+            Debug.LogWarning("Cannot reduce polygons because the mesh is null.");
             return null;
+        }
 
         int vertexCount = mesh.vertexCount;
         if (vertexCount < 3)
+        {
+            Debug.LogWarning($"Mesh '{mesh.name}' does not have enough vertices to perform reduction.");
             return null;
+        }
 
         int originalTriangles = CountTotalTriangles(mesh);
         if (originalTriangles <= 0)
+        {
+            Debug.LogWarning($"Mesh '{mesh.name}' does not contain any triangles to reduce.");
             return null;
+        }
 
         bool useMask = vertexMask != null;
         if (vertexMask != null && vertexMask.Length != vertexCount)
@@ -189,7 +198,10 @@ public static class MeshPolygonReducer
                     candidateVertices++;
             }
             if (candidateVertices < 3)
+            {
+                Debug.LogWarning($"Bounds restriction leaves fewer than three vertices eligible for reduction on mesh '{mesh.name}'.");
                 return null;
+            }
         }
         else
         {
@@ -198,7 +210,10 @@ public static class MeshPolygonReducer
 
         reductionRatio = Mathf.Clamp01(reductionRatio);
         if (reductionRatio <= 0f)
+        {
+            Debug.LogWarning($"Reduction ratio of {reductionRatio:P0} does not remove any polygons for mesh '{mesh.name}'.");
             return null;
+        }
 
         float targetTriangleFloat = Mathf.Max(1f, originalTriangles * (1f - reductionRatio));
         int targetTriangles = Mathf.Max(1, Mathf.RoundToInt(targetTriangleFloat));
@@ -207,10 +222,16 @@ public static class MeshPolygonReducer
         upperTriangleBound = Mathf.Min(upperTriangleBound, originalTriangles);
         int desiredCandidateVertices = Mathf.Max(3, candidateVertices - Mathf.RoundToInt(candidateVertices * reductionRatio));
         if (desiredCandidateVertices >= candidateVertices)
+        {
+            Debug.LogWarning($"Requested reduction keeps all {candidateVertices} candidate vertices on mesh '{mesh.name}'. Increase the reduction percent or relax the bounds.");
             return null;
+        }
 
         if (candidateVertices <= 3)
+        {
+            Debug.LogWarning($"Only {candidateVertices} vertices are available for reduction on mesh '{mesh.name}'. The reduction percent is too small for the selected bounds.");
             return null;
+        }
 
         int maxCandidateVertices = candidateVertices - 1;
         int minTarget = Mathf.Clamp(desiredCandidateVertices, 3, maxCandidateVertices);
@@ -320,8 +341,10 @@ public static class MeshPolygonReducer
         int total = 0;
         for (int i = 0; i < subMeshCount; i++)
         {
-            var tris = mesh.GetTriangles(i);
-            total += tris.Length / 3;
+            if (mesh.GetTopology(i) != MeshTopology.Triangles)
+                continue;
+
+            total += (int)(mesh.GetIndexCount(i) / 3);
         }
 
         return total;

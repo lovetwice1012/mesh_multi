@@ -1,9 +1,6 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
-using Unity.Burst;
-using Unity.Collections;
-using Unity.Jobs;
-using Unity.Mathematics;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -385,78 +382,107 @@ public static class MeshMulti
 
     internal static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds)
     {
+        if (mesh == null)
+            return Array.Empty<bool>();
+
         var vertices = mesh.vertices;
         var inside = new bool[vertices.Length];
         if (vertices.Length == 0)
             return inside;
 
-        var nativeVertices = new NativeArray<float3>(vertices.Length, Allocator.TempJob);
-        var jobResult = new NativeArray<byte>(vertices.Length, Allocator.TempJob);
-
-        try
+        var worldPositions = new Vector3[vertices.Length];
+        bool usedSkinning = TryComputeSkinnedWorldPositions(renderer, mesh, vertices, worldPositions);
+        if (!usedSkinning)
         {
+            Matrix4x4 localToWorld = renderer != null ? renderer.transform.localToWorldMatrix : Matrix4x4.identity;
             for (int i = 0; i < vertices.Length; i++)
-            {
-                var v = vertices[i];
-                nativeVertices[i] = new float3(v.x, v.y, v.z);
-            }
-
-            Matrix4x4 unityMatrix = renderer.transform.localToWorldMatrix;
-            float4x4 localToWorld = ConvertToFloat4x4(unityMatrix);
-            Vector3 boundsMin = bounds.min;
-            Vector3 boundsMax = bounds.max;
-
-            var job = new BoundsContainmentJob
-            {
-                Vertices = nativeVertices,
-                LocalToWorld = localToWorld,
-                BoundsMin = new float3(boundsMin.x, boundsMin.y, boundsMin.z),
-                BoundsMax = new float3(boundsMax.x, boundsMax.y, boundsMax.z),
-                Result = jobResult
-            };
-
-            JobHandle handle = job.Schedule(vertices.Length, 64);
-            handle.Complete();
-
-            for (int i = 0; i < inside.Length; i++)
-                inside[i] = jobResult[i] != 0;
+                worldPositions[i] = localToWorld.MultiplyPoint3x4(vertices[i]);
         }
-        finally
+
+        Vector3 boundsMin = bounds.min;
+        Vector3 boundsMax = bounds.max;
+        for (int i = 0; i < worldPositions.Length; i++)
         {
-            if (jobResult.IsCreated)
-                jobResult.Dispose();
-            if (nativeVertices.IsCreated)
-                nativeVertices.Dispose();
+            Vector3 w = worldPositions[i];
+            inside[i] = w.x >= boundsMin.x && w.x <= boundsMax.x &&
+                        w.y >= boundsMin.y && w.y <= boundsMax.y &&
+                        w.z >= boundsMin.z && w.z <= boundsMax.z;
         }
 
         return inside;
     }
 
-    [BurstCompile]
-    private struct BoundsContainmentJob : IJobParallelFor
+    private static bool TryComputeSkinnedWorldPositions(SkinnedMeshRenderer renderer, Mesh mesh, Vector3[] vertices, Vector3[] worldPositions)
     {
-        [ReadOnly] public NativeArray<float3> Vertices;
-        public float4x4 LocalToWorld;
-        public float3 BoundsMin;
-        public float3 BoundsMax;
-        public NativeArray<byte> Result;
+        if (renderer == null)
+            return false;
 
-        public void Execute(int index)
+        var boneWeights = mesh.boneWeights;
+        var bindPoses = mesh.bindposes;
+        var bones = renderer.bones;
+
+        if (boneWeights == null || boneWeights.Length != vertices.Length)
+            return false;
+
+        if (bindPoses == null || bindPoses.Length == 0)
+            return false;
+
+        if (bones == null || bones.Length == 0)
+            return false;
+
+        int matrixCount = Math.Min(bindPoses.Length, bones.Length);
+        if (matrixCount == 0)
+            return false;
+
+        var boneMatrices = new Matrix4x4[matrixCount];
+        Matrix4x4 fallbackMatrix = renderer.transform.localToWorldMatrix;
+        for (int i = 0; i < matrixCount; i++)
         {
-            float4 world4 = math.mul(LocalToWorld, new float4(Vertices[index], 1f));
-            float3 world = world4.xyz;
-            bool inside = math.all(world >= BoundsMin & world <= BoundsMax);
-            Result[index] = inside ? (byte)1 : (byte)0;
+            Transform bone = bones[i];
+            Matrix4x4 boneMatrix = bone != null ? bone.localToWorldMatrix : fallbackMatrix;
+            boneMatrices[i] = boneMatrix * bindPoses[i];
         }
+
+        bool anySkinningApplied = false;
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            BoneWeight weight = boneWeights[i];
+            Vector3 local = vertices[i];
+            float totalWeight = 0f;
+            Vector3 skinned = Vector3.zero;
+
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight0, weight.boneIndex0, boneMatrices, matrixCount, local);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight1, weight.boneIndex1, boneMatrices, matrixCount, local);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight2, weight.boneIndex2, boneMatrices, matrixCount, local);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight3, weight.boneIndex3, boneMatrices, matrixCount, local);
+
+            if (totalWeight > 0f)
+            {
+                float remainder = Mathf.Clamp01(1f - totalWeight);
+                if (remainder > 0f)
+                    skinned += fallbackMatrix.MultiplyPoint3x4(local) * remainder;
+                worldPositions[i] = skinned;
+                anySkinningApplied = true;
+            }
+            else
+            {
+                worldPositions[i] = fallbackMatrix.MultiplyPoint3x4(local);
+            }
+        }
+
+        return anySkinningApplied;
     }
 
-    private static float4x4 ConvertToFloat4x4(Matrix4x4 matrix)
+    private static void ApplyBoneWeight(ref Vector3 accum, ref float totalWeight, float weight, int boneIndex, Matrix4x4[] boneMatrices, int matrixCount, Vector3 localPosition)
     {
-        return new float4x4(
-            new float4(matrix.m00, matrix.m01, matrix.m02, matrix.m03),
-            new float4(matrix.m10, matrix.m11, matrix.m12, matrix.m13),
-            new float4(matrix.m20, matrix.m21, matrix.m22, matrix.m23),
-            new float4(matrix.m30, matrix.m31, matrix.m32, matrix.m33));
+        if (weight <= 0f)
+            return;
+
+        if (boneIndex < 0 || boneIndex >= matrixCount)
+            return;
+
+        accum += boneMatrices[boneIndex].MultiplyPoint3x4(localPosition) * weight;
+        totalWeight += weight;
     }
 
     private struct TriangleData

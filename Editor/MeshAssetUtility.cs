@@ -24,7 +24,17 @@ public static class MeshAssetUtility
         string candidatePath = CombineAssetPath(directory, fileName);
         candidatePath = AssetDatabase.GenerateUniqueAssetPath(candidatePath);
 
-        AssetDatabase.CreateAsset(mesh, candidatePath);
+        try
+        {
+            AssetDatabase.CreateAsset(mesh, candidatePath);
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Failed to create derived mesh asset at '{candidatePath}': {ex.Message}");
+            return false;
+        }
+
+        Undo.RegisterCreatedObjectUndo(mesh, "Create Derived Mesh Asset");
         assetPath = candidatePath;
         return true;
     }

@@ -1378,6 +1378,19 @@ internal sealed class ArapMeshSimplifier
 
     private void SolveGlobalStep(Dictionary<int, float>[] weights, Vector3[] rhs)
     {
+        bool hasLockedVertices = false;
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            var v = vertices[i];
+            if (v == null || v.Removed)
+                continue;
+            if (v.Locked)
+            {
+                hasLockedVertices = true;
+                break;
+            }
+        }
+
         List<int> freeVertices = new List<int>();
         int[] indexMap = new int[vertices.Length];
         for (int i = 0; i < vertices.Length; i++)
@@ -1451,6 +1464,20 @@ internal sealed class ArapMeshSimplifier
         float[] solutionY = (float[])initialY.Clone();
         float[] solutionZ = (float[])initialZ.Clone();
 
+        if (!hasLockedVertices && n > 0)
+        {
+            const float anchorWeight = OriginalPositionPenaltyWeight;
+            int anchorVertex = freeVertices[0];
+            var anchor = vertices[anchorVertex];
+            rows[0].Diagonal += anchorWeight;
+            rhsX[0] += anchorWeight * anchor.RestPosition.x;
+            rhsY[0] += anchorWeight * anchor.RestPosition.y;
+            rhsZ[0] += anchorWeight * anchor.RestPosition.z;
+            solutionX[0] = anchor.RestPosition.x;
+            solutionY[0] = anchor.RestPosition.y;
+            solutionZ[0] = anchor.RestPosition.z;
+        }
+
         ConjugateGradient(rows, rhsX, solutionX);
         ConjugateGradient(rows, rhsY, solutionY);
         ConjugateGradient(rows, rhsZ, solutionZ);
@@ -1481,6 +1508,8 @@ internal sealed class ArapMeshSimplifier
 
         float deltaNew = Dot(residual, residual);
         float delta0 = deltaNew;
+        if (delta0 <= ConjugateGradientTolerance * ConjugateGradientTolerance)
+            return;
         int iter = 0;
         while (iter < MaxConjugateGradientIterations && deltaNew > ConjugateGradientTolerance * ConjugateGradientTolerance * delta0)
         {
