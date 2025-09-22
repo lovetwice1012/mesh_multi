@@ -592,17 +592,11 @@ public class MeshPolygonReducerWindow : EditorWindow
 
             bool inRange = !restrictToBounds || (boundsValid && hasVerticesInBounds);
             if (inRange) includedRenderers++;
-            int totalTriangles = mesh.triangles.Length / 3;
+            int totalTriangles = MeshPolygonReducer.CountTotalTriangles(mesh);
             int affectedTriangles = totalTriangles;
             if (restrictToBounds && boundsValid && mask != null)
             {
-                affectedTriangles = 0;
-                var triangles = mesh.triangles;
-                for (int i = 0; i < triangles.Length; i += 3)
-                {
-                    if (mask[triangles[i]] && mask[triangles[i + 1]] && mask[triangles[i + 2]])
-                        affectedTriangles++;
-                }
+                affectedTriangles = CountTrianglesWithinMask(mesh, mask);
             }
             int predictedRemoval = Mathf.RoundToInt(affectedTriangles * (Mathf.Clamp01(reductionPercent / 100f)));
             int predictedTriangles = Mathf.Max(0, totalTriangles - predictedRemoval);
@@ -719,6 +713,53 @@ public class MeshPolygonReducerWindow : EditorWindow
 
         Handles.color = prevColor;
         Handles.zTest = prevZTest;
+    }
+
+    private static int CountTrianglesWithinMask(Mesh mesh, bool[] mask)
+    {
+        if (mesh == null || mask == null)
+            return 0;
+
+        int total = 0;
+        int subMeshCount = mesh.subMeshCount;
+        if (subMeshCount <= 0)
+        {
+            var triangles = mesh.triangles;
+            if (triangles == null)
+                return 0;
+
+            for (int i = 0; i + 2 < triangles.Length; i += 3)
+            {
+                if (IsTriangleInsideMask(mask, triangles[i], triangles[i + 1], triangles[i + 2]))
+                    total++;
+            }
+
+            return total;
+        }
+
+        for (int subMesh = 0; subMesh < subMeshCount; subMesh++)
+        {
+            if (mesh.GetTopology(subMesh) != MeshTopology.Triangles)
+                continue;
+
+            var indices = mesh.GetIndices(subMesh);
+            for (int i = 0; i + 2 < indices.Length; i += 3)
+            {
+                if (IsTriangleInsideMask(mask, indices[i], indices[i + 1], indices[i + 2]))
+                    total++;
+            }
+        }
+
+        return total;
+    }
+
+    private static bool IsTriangleInsideMask(bool[] mask, int a, int b, int c)
+    {
+        int maskLength = mask.Length;
+        if (a < 0 || a >= maskLength || b < 0 || b >= maskLength || c < 0 || c >= maskLength)
+            return false;
+
+        return mask[a] && mask[b] && mask[c];
     }
 
     private void SyncBoundsWithSelection()
