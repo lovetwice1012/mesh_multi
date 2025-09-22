@@ -161,7 +161,11 @@ public static class MeshPolygonReducer
         if (reductionRatio <= 0f)
             return null;
 
-        int targetTriangles = Mathf.Max(1, originalTriangles - Mathf.RoundToInt(originalTriangles * reductionRatio));
+        float targetTriangleFloat = Mathf.Max(1f, originalTriangles * (1f - reductionRatio));
+        int targetTriangles = Mathf.Max(1, Mathf.RoundToInt(targetTriangleFloat));
+        int lowerTriangleBound = Mathf.Max(1, Mathf.RoundToInt(targetTriangleFloat * 0.95f));
+        int upperTriangleBound = Mathf.Max(lowerTriangleBound, Mathf.RoundToInt(targetTriangleFloat * 1.05f));
+        upperTriangleBound = Mathf.Min(upperTriangleBound, originalTriangles);
         int desiredCandidateVertices = Mathf.Max(3, candidateVertices - Mathf.RoundToInt(candidateVertices * reductionRatio));
         if (desiredCandidateVertices >= candidateVertices)
             return null;
@@ -175,6 +179,8 @@ public static class MeshPolygonReducer
         int high = maxCandidateVertices;
         Mesh bestMesh = null;
         bool success = false;
+        float bestDeviation = float.MaxValue;
+        int bestTriangleCount = -1;
 
         while (low <= high)
         {
@@ -182,19 +188,38 @@ public static class MeshPolygonReducer
             if (TrySimplify(mesh, vertexMask, target, out var simplified))
             {
                 int simplifiedTriangles = CountTotalTriangles(simplified);
-                if (simplifiedTriangles < targetTriangles)
+                if (simplifiedTriangles < lowerTriangleBound)
                 {
                     UnityEngine.Object.DestroyImmediate(simplified);
                     low = target + 1;
                     continue;
                 }
 
-                if (bestMesh != null)
-                    UnityEngine.Object.DestroyImmediate(bestMesh);
+                if (simplifiedTriangles > upperTriangleBound)
+                {
+                    UnityEngine.Object.DestroyImmediate(simplified);
+                    high = target - 1;
+                    continue;
+                }
 
-                bestMesh = simplified;
+                float deviation = Mathf.Abs(simplifiedTriangles - targetTriangles);
+                bool shouldReplace = !success || deviation < bestDeviation ||
+                                     (Mathf.Approximately(deviation, bestDeviation) && simplifiedTriangles > bestTriangleCount);
+                if (shouldReplace)
+                {
+                    if (bestMesh != null)
+                        UnityEngine.Object.DestroyImmediate(bestMesh);
+                    bestMesh = simplified;
+                    bestDeviation = deviation;
+                    bestTriangleCount = simplifiedTriangles;
+                }
+                else
+                {
+                    UnityEngine.Object.DestroyImmediate(simplified);
+                }
+
                 success = true;
-                high = target - 1;
+                low = target + 1;
             }
             else
             {
