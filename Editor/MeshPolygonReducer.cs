@@ -161,15 +161,55 @@ public static class MeshPolygonReducer
         if (desiredCandidateVertices >= candidateVertices)
             return null;
 
+        if (candidateVertices <= 3)
+            return null;
+
+        int maxCandidateVertices = candidateVertices - 1;
+        int minTarget = Mathf.Clamp(desiredCandidateVertices, 3, maxCandidateVertices);
+        int low = minTarget;
+        int high = maxCandidateVertices;
+        Mesh bestMesh = null;
+        bool success = false;
+
+        while (low <= high)
+        {
+            int target = (low + high) / 2;
+            if (TrySimplify(mesh, vertexMask, target, out var simplified))
+            {
+                if (bestMesh != null)
+                    UnityEngine.Object.DestroyImmediate(bestMesh);
+
+                bestMesh = simplified;
+                success = true;
+                high = target - 1;
+            }
+            else
+            {
+                low = target + 1;
+            }
+        }
+
+        return success ? bestMesh : null;
+    }
+
+    private static bool TrySimplify(Mesh mesh, bool[] vertexMask, int targetCandidateCount, out Mesh simplified)
+    {
         var simplifier = new ArapMeshSimplifier(mesh, vertexMask);
-        var simplifierResult = simplifier.Simplify(desiredCandidateVertices);
-        if (!simplifierResult.HasValue)
-            return null;
+        var result = simplifier.Simplify(targetCandidateCount);
+        if (result.HasValue)
+        {
+            if (result.Value.RemovedTriangles && result.Value.Mesh != null)
+            {
+                simplified = result.Value.Mesh;
+                return true;
+            }
 
-        if (!simplifierResult.Value.RemovedTriangles)
-            return null;
+            if (result.Value.Mesh != null)
+                UnityEngine.Object.DestroyImmediate(result.Value.Mesh);
+        }
 
-        return simplifierResult.Value.Mesh;
+        simplified = null;
+        return false;
     }
 }
 
