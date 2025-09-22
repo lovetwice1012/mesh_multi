@@ -73,6 +73,9 @@ public static class MeshPolygonReducer
         bool assetCreated = false;
         bool anyRendererModified = false;
         bool assetEditingStarted = false;
+        int totalOriginalTriangles = 0;
+        int totalReducedTriangles = 0;
+
         try
         {
             for (int i = 0; i < total; i++)
@@ -84,6 +87,10 @@ public static class MeshPolygonReducer
                 if (originalMesh == null)
                     continue;
 
+                int originalTriangleCount = CountTotalTriangles(originalMesh);
+                if (originalTriangleCount <= 0)
+                    continue;
+
                 bool[] vertexMask = null;
                 if (limitBounds.HasValue)
                     vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache);
@@ -93,6 +100,9 @@ public static class MeshPolygonReducer
                 var newMesh = ReduceMesh(originalMesh, reductionRatio, vertexMask, seed);
                 if (newMesh == null)
                     continue;
+
+                totalOriginalTriangles += originalTriangleCount;
+                totalReducedTriangles += Mathf.Max(0, CountTotalTriangles(newMesh));
 
                 float percent = ((float)(i + 1) / total) * 100f;
                 percent = Mathf.Floor(percent * 1000f) / 1000f;
@@ -140,8 +150,14 @@ public static class MeshPolygonReducer
         if (anyRendererModified)
             SceneView.RepaintAll();
 
-        float finalPercent = Mathf.Floor(100f * 1000f) / 1000f;
-        Debug.Log(string.Format("Reduced polygons for {0} meshes under '{1}' ({2:F3}%).", targetRenderers.Count, selected.name, finalPercent));
+        float finalPercent = 0f;
+        if (totalOriginalTriangles > 0)
+        {
+            float reduction = 1f - (float)totalReducedTriangles / totalOriginalTriangles;
+            finalPercent = Mathf.Clamp(reduction * 100f, 0f, 100f);
+        }
+        finalPercent = Mathf.Floor(finalPercent * 1000f) / 1000f;
+        Debug.Log(string.Format("Reduced polygons for {0} meshes under '{1}' ({2:F3}% reduction).", targetRenderers.Count, selected.name, finalPercent));
     }
 
     private static Mesh ReduceMesh(Mesh mesh, float reductionRatio, bool[] vertexMask, int? seed)
@@ -157,13 +173,19 @@ public static class MeshPolygonReducer
         if (originalTriangles <= 0)
             return null;
 
-        bool useMask = vertexMask != null && vertexMask.Length == vertexCount;
-        int candidateVertices = 0;
-        if (useMask)
+        bool useMask = vertexMask != null;
+        if (vertexMask != null && vertexMask.Length != vertexCount)
         {
-            for (int i = 0; i < vertexMask.Length; i++)
+            Debug.LogWarning($"Vertex mask length ({vertexMask.Length}) does not match vertex count ({vertexCount}) on mesh '{mesh.name}'. Ignoring mask.");
+            useMask = false;
+        }
+        bool[] effectiveMask = useMask ? vertexMask : null;
+        int candidateVertices = 0;
+        if (effectiveMask != null)
+        {
+            for (int i = 0; i < effectiveMask.Length; i++)
             {
-                if (vertexMask[i])
+                if (effectiveMask[i])
                     candidateVertices++;
             }
             if (candidateVertices < 3)
@@ -199,7 +221,7 @@ public static class MeshPolygonReducer
         float bestDeviation = float.MaxValue;
         int bestTriangleCount = -1;
 
-        var simplifier = new ArapMeshSimplifier(mesh, vertexMask);
+        var simplifier = new ArapMeshSimplifier(mesh, effectiveMask, seed);
 
         while (low <= high)
         {
@@ -238,7 +260,7 @@ public static class MeshPolygonReducer
                 }
 
                 success = true;
-                low = target + 1;
+                high = target - 1;
             }
             else
             {
