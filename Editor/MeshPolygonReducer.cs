@@ -314,19 +314,127 @@ public static class MeshPolygonReducer
     private static bool[] GetOrCreateMask(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds, Dictionary<MaskCacheKey, bool[]> cache)
     {
         if (cache == null)
-            return MeshMulti.CalculateVerticesInsideBounds(renderer, mesh, bounds);
+            return CalculateVerticesInsideBounds(renderer, mesh, bounds);
 
         var key = new MaskCacheKey(renderer, mesh, bounds);
         if (!cache.TryGetValue(key, out var mask))
         {
-            mask = MeshMulti.CalculateVerticesInsideBounds(renderer, mesh, bounds);
+            mask = CalculateVerticesInsideBounds(renderer, mesh, bounds);
             cache[key] = mask;
         }
 
         return mask;
     }
 
-    internal static int CountTotalTriangles(Mesh mesh)
+    private static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds)
+    {
+        if (mesh == null)
+            return Array.Empty<bool>();
+
+        var vertices = mesh.vertices;
+        if (vertices == null)
+            return Array.Empty<bool>();
+
+        var inside = new bool[vertices.Length];
+        if (vertices.Length == 0)
+            return inside;
+
+        var worldPositions = new Vector3[vertices.Length];
+        bool usedSkinning = TryComputeSkinnedWorldPositions(renderer, mesh, vertices, worldPositions);
+        if (!usedSkinning)
+        {
+            Matrix4x4 localToWorld = renderer != null ? renderer.transform.localToWorldMatrix : Matrix4x4.identity;
+            for (int i = 0; i < vertices.Length; i++)
+                worldPositions[i] = localToWorld.MultiplyPoint3x4(vertices[i]);
+        }
+
+        Vector3 boundsMin = bounds.min;
+        Vector3 boundsMax = bounds.max;
+        for (int i = 0; i < worldPositions.Length; i++)
+        {
+            Vector3 w = worldPositions[i];
+            inside[i] = w.x >= boundsMin.x && w.x <= boundsMax.x &&
+                        w.y >= boundsMin.y && w.y <= boundsMax.y &&
+                        w.z >= boundsMin.z && w.z <= boundsMax.z;
+        }
+
+        return inside;
+    }
+
+    private static bool TryComputeSkinnedWorldPositions(SkinnedMeshRenderer renderer, Mesh mesh, Vector3[] vertices, Vector3[] worldPositions)
+    {
+        if (renderer == null)
+            return false;
+
+        var boneWeights = mesh.boneWeights;
+        var bindPoses = mesh.bindposes;
+        var bones = renderer.bones;
+
+        if (boneWeights == null || boneWeights.Length != vertices.Length)
+            return false;
+
+        if (bindPoses == null || bindPoses.Length == 0)
+            return false;
+
+        if (bones == null || bones.Length == 0)
+            return false;
+
+        int matrixCount = Math.Min(bindPoses.Length, bones.Length);
+        if (matrixCount == 0)
+            return false;
+
+        var boneMatrices = new Matrix4x4[matrixCount];
+        Matrix4x4 fallbackMatrix = renderer.transform.localToWorldMatrix;
+        for (int i = 0; i < matrixCount; i++)
+        {
+            Transform bone = bones[i];
+            Matrix4x4 boneMatrix = bone != null ? bone.localToWorldMatrix : fallbackMatrix;
+            boneMatrices[i] = boneMatrix * bindPoses[i];
+        }
+
+        bool anySkinningApplied = false;
+        for (int i = 0; i < vertices.Length; i++)
+        {
+            BoneWeight weight = boneWeights[i];
+            Vector3 local = vertices[i];
+            float totalWeight = 0f;
+            Vector3 skinned = Vector3.zero;
+
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight0, weight.boneIndex0, boneMatrices, matrixCount, local);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight1, weight.boneIndex1, boneMatrices, matrixCount, local);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight2, weight.boneIndex2, boneMatrices, matrixCount, local);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight3, weight.boneIndex3, boneMatrices, matrixCount, local);
+
+            if (totalWeight > 0f)
+            {
+                float remainder = Mathf.Clamp01(1f - totalWeight);
+                if (remainder > 0f)
+                    skinned += fallbackMatrix.MultiplyPoint3x4(local) * remainder;
+                worldPositions[i] = skinned;
+                anySkinningApplied = true;
+            }
+            else
+            {
+                worldPositions[i] = fallbackMatrix.MultiplyPoint3x4(local);
+            }
+        }
+
+        return anySkinningApplied;
+    }
+
+    private static void ApplyBoneWeight(ref Vector3 accum, ref float totalWeight, float weight, int boneIndex, Matrix4x4[] boneMatrices, int matrixCount, Vector3 localPosition)
+    {
+        if (weight <= 0f)
+            return;
+
+        if (boneIndex < 0 || boneIndex >= matrixCount)
+            return;
+
+        accum += boneMatrices[boneIndex].MultiplyPoint3x4(localPosition) * weight;
+        totalWeight += weight;
+    }
+
+    private static int CountTotalTriangles(Mesh mesh)
     {
         if (mesh == null)
             return 0;
@@ -471,7 +579,7 @@ public class MeshPolygonReducerWindow : EditorWindow
             bool[] mask = null;
             if (restrictToBounds && boundsValid)
             {
-                mask = MeshMulti.CalculateVerticesInsideBounds(renderer, mesh, activeBounds);
+                mask = CalculateVerticesInsideBounds(renderer, mesh, activeBounds);
                 for (int v = 0; v < mask.Length; v++)
                 {
                     if (mask[v])
