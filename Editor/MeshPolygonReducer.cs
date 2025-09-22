@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Unity.Collections;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -75,6 +76,7 @@ public static class MeshPolygonReducer
         bool assetEditingStarted = false;
         int totalOriginalTriangles = 0;
         int totalReducedTriangles = 0;
+        int successfulRenderers = 0;
 
         try
         {
@@ -101,9 +103,6 @@ public static class MeshPolygonReducer
                 if (newMesh == null)
                     continue;
 
-                totalOriginalTriangles += originalTriangleCount;
-                totalReducedTriangles += Mathf.Max(0, CountTotalTriangles(newMesh));
-
                 float percent = ((float)(i + 1) / total) * 100f;
                 percent = Mathf.Floor(percent * 1000f) / 1000f;
                 EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
@@ -116,22 +115,25 @@ public static class MeshPolygonReducer
                 }
 
                 bool createdAsset = MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "reduced", out _);
-                if (createdAsset)
+                if (!createdAsset)
                 {
-                    assetCreated = true;
-                    renderer.sharedMesh = newMesh;
-                }
-                else
-                {
-                    renderer.sharedMesh = newMesh;
+                    Debug.LogError($"Failed to create reduced mesh asset for '{renderer.name}'. The original mesh will remain unchanged.");
+                    renderer.sharedMesh = originalMesh;
+                    UnityEngine.Object.DestroyImmediate(newMesh);
+                    continue;
                 }
 
+                assetCreated = true;
+                renderer.sharedMesh = newMesh;
                 EditorUtility.SetDirty(renderer);
                 if (renderer.sharedMesh != null)
                     EditorUtility.SetDirty(renderer.sharedMesh);
                 PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
                 EditorSceneManager.MarkSceneDirty(renderer.gameObject.scene);
                 anyRendererModified = true;
+                successfulRenderers++;
+                totalOriginalTriangles += originalTriangleCount;
+                totalReducedTriangles += Mathf.Max(0, CountTotalTriangles(newMesh));
             }
         }
         finally
@@ -157,7 +159,7 @@ public static class MeshPolygonReducer
             finalPercent = Mathf.Clamp(reduction * 100f, 0f, 100f);
         }
         finalPercent = Mathf.Floor(finalPercent * 1000f) / 1000f;
-        Debug.Log(string.Format("Reduced polygons for {0} meshes under '{1}' ({2:F3}% reduction).", targetRenderers.Count, selected.name, finalPercent));
+        Debug.Log(string.Format("Reduced polygons for {0}/{1} meshes under '{2}' ({3:F3}% reduction).", successfulRenderers, targetRenderers.Count, selected.name, finalPercent));
     }
 
     private static Mesh ReduceMesh(Mesh mesh, float reductionRatio, bool[] vertexMask, int? seed)
@@ -331,8 +333,7 @@ public static class MeshPolygonReducer
         if (mesh == null)
             return Array.Empty<bool>();
 
-        var vertices = mesh.vertices;
-        if (vertices == null)
+        if (!TryGetMeshVertices(mesh, out var vertices) || vertices == null)
             return Array.Empty<bool>();
 
         var inside = new bool[vertices.Length];
@@ -366,7 +367,8 @@ public static class MeshPolygonReducer
         if (renderer == null)
             return false;
 
-        var boneWeights = mesh.boneWeights;
+        if (!TryGetBoneWeights(mesh, out var boneWeights) || boneWeights == null)
+            return false;
         var bindPoses = mesh.bindposes;
         var bones = renderer.bones;
 
@@ -434,28 +436,170 @@ public static class MeshPolygonReducer
         totalWeight += weight;
     }
 
+    private static bool TryGetMeshVertices(Mesh mesh, out Vector3[] vertices)
+    {
+        vertices = null;
+        if (mesh == null)
+            return false;
+
+        try
+        {
+            using (var meshDataArray = Mesh.AcquireReadOnlyMeshData(mesh))
+            {
+                if (meshDataArray.Length == 0)
+                    return false;
+
+                var meshData = meshDataArray[0];
+                int count = meshData.vertexCount;
+                vertices = new Vector3[count];
+                if (count == 0)
+                    return true;
+
+                using (var native = new NativeArray<Vector3>(count, Allocator.Temp))
+                {
+                    meshData.GetVertices(native);
+                    native.CopyTo(vertices);
+                }
+                return true;
+            }
+        }
+        catch
+        {
+            vertices = null;
+            return false;
+        }
+    }
+
+    private static bool TryGetBoneWeights(Mesh mesh, out BoneWeight[] boneWeights)
+    {
+        boneWeights = null;
+        if (mesh == null)
+            return false;
+
+        try
+        {
+            using (var meshDataArray = Mesh.AcquireReadOnlyMeshData(mesh))
+            {
+                if (meshDataArray.Length == 0)
+                    return false;
+
+                var meshData = meshDataArray[0];
+                if (!meshData.HasVertexAttribute(VertexAttribute.BlendWeight) ||
+                    !meshData.HasVertexAttribute(VertexAttribute.BlendIndices))
+                    return false;
+
+                int vertexCount = meshData.vertexCount;
+                var result = new BoneWeight[vertexCount];
+                var bonesPerVertex = meshData.GetBonesPerVertex();
+                var allWeights = meshData.GetAllBoneWeights();
+
+                try
+                {
+                    if (!bonesPerVertex.IsCreated || !allWeights.IsCreated)
+                        return false;
+
+                    int offset = 0;
+                    for (int i = 0; i < vertexCount; i++)
+                    {
+                        int influenceCount = i < bonesPerVertex.Length ? bonesPerVertex[i] : 0;
+                        influenceCount = Mathf.Clamp(influenceCount, 0, Mathf.Max(0, allWeights.Length - offset));
+
+                        BoneWeight weight = new BoneWeight();
+                        for (int j = 0; j < influenceCount && j < 4; j++)
+                        {
+                            var w = allWeights[offset + j];
+                            switch (j)
+                            {
+                                case 0:
+                                    weight.boneIndex0 = w.boneIndex;
+                                    weight.weight0 = w.weight;
+                                    break;
+                                case 1:
+                                    weight.boneIndex1 = w.boneIndex;
+                                    weight.weight1 = w.weight;
+                                    break;
+                                case 2:
+                                    weight.boneIndex2 = w.boneIndex;
+                                    weight.weight2 = w.weight;
+                                    break;
+                                case 3:
+                                    weight.boneIndex3 = w.boneIndex;
+                                    weight.weight3 = w.weight;
+                                    break;
+                            }
+                        }
+
+                        NormalizeBoneWeight(ref weight);
+                        result[i] = weight;
+                        offset += influenceCount;
+                    }
+                }
+                finally
+                {
+                    if (bonesPerVertex.IsCreated)
+                        bonesPerVertex.Dispose();
+                    if (allWeights.IsCreated)
+                        allWeights.Dispose();
+                }
+
+                boneWeights = result;
+                return true;
+            }
+        }
+        catch
+        {
+            boneWeights = null;
+            return false;
+        }
+    }
+
+    private static void NormalizeBoneWeight(ref BoneWeight weight)
+    {
+        float total = weight.weight0 + weight.weight1 + weight.weight2 + weight.weight3;
+        if (total <= 0f)
+            return;
+        float inv = 1f / total;
+        weight.weight0 *= inv;
+        weight.weight1 *= inv;
+        weight.weight2 *= inv;
+        weight.weight3 *= inv;
+    }
+
     private static int CountTotalTriangles(Mesh mesh)
     {
         if (mesh == null)
             return 0;
 
-        int subMeshCount = mesh.subMeshCount;
-        if (subMeshCount <= 0)
+        using (var meshDataArray = Mesh.AcquireReadOnlyMeshData(mesh))
         {
-            var tris = mesh.triangles;
-            return tris != null ? tris.Length / 3 : 0;
+            if (meshDataArray.Length == 0)
+                return 0;
+
+            var meshData = meshDataArray[0];
+            int subMeshCount = Mathf.Max(1, Mathf.Max(mesh.subMeshCount, meshData.subMeshCount));
+            int total = 0;
+            for (int i = 0; i < subMeshCount; i++)
+            {
+                MeshTopology topology;
+                if (mesh.subMeshCount > 0 && i < mesh.subMeshCount)
+                    topology = mesh.GetTopology(i);
+                else if (i < meshData.subMeshCount)
+                    topology = meshData.GetSubMesh(i).topology;
+                else
+                    topology = MeshTopology.Triangles;
+
+                if (topology != MeshTopology.Triangles)
+                    continue;
+
+                if (i < meshData.subMeshCount)
+                {
+                    var descriptor = meshData.GetSubMesh(i);
+                    total += descriptor.indexCount / 3;
+                }
+            }
+
+            return total;
         }
-
-        int total = 0;
-        for (int i = 0; i < subMeshCount; i++)
-        {
-            if (mesh.GetTopology(i) != MeshTopology.Triangles)
-                continue;
-
-            total += (int)(mesh.GetIndexCount(i) / 3);
-        }
-
-        return total;
     }
 }
 
@@ -720,37 +864,45 @@ public class MeshPolygonReducerWindow : EditorWindow
         if (mesh == null || mask == null)
             return 0;
 
-        int total = 0;
-        int subMeshCount = mesh.subMeshCount;
-        if (subMeshCount <= 0)
+        using (var meshDataArray = Mesh.AcquireReadOnlyMeshData(mesh))
         {
-            var triangles = mesh.triangles;
-            if (triangles == null)
+            if (meshDataArray.Length == 0)
                 return 0;
 
-            for (int i = 0; i + 2 < triangles.Length; i += 3)
+            var meshData = meshDataArray[0];
+            int subMeshCount = Mathf.Max(1, Mathf.Max(mesh.subMeshCount, meshData.subMeshCount));
+            int total = 0;
+
+            for (int subMesh = 0; subMesh < subMeshCount; subMesh++)
             {
-                if (IsTriangleInsideMask(mask, triangles[i], triangles[i + 1], triangles[i + 2]))
-                    total++;
+                MeshTopology topology;
+                if (mesh.subMeshCount > 0 && subMesh < mesh.subMeshCount)
+                    topology = mesh.GetTopology(subMesh);
+                else if (subMesh < meshData.subMeshCount)
+                    topology = meshData.GetSubMesh(subMesh).topology;
+                else
+                    topology = MeshTopology.Triangles;
+
+                if (topology != MeshTopology.Triangles || subMesh >= meshData.subMeshCount)
+                    continue;
+
+                var descriptor = meshData.GetSubMesh(subMesh);
+                if (descriptor.indexCount == 0)
+                    continue;
+
+                using (var indices = new NativeArray<int>(descriptor.indexCount, Allocator.Temp))
+                {
+                    meshData.GetIndices(indices, subMesh);
+                    for (int i = 0; i + 2 < indices.Length; i += 3)
+                    {
+                        if (IsTriangleInsideMask(mask, indices[i], indices[i + 1], indices[i + 2]))
+                            total++;
+                    }
+                }
             }
 
             return total;
         }
-
-        for (int subMesh = 0; subMesh < subMeshCount; subMesh++)
-        {
-            if (mesh.GetTopology(subMesh) != MeshTopology.Triangles)
-                continue;
-
-            var indices = mesh.GetIndices(subMesh);
-            for (int i = 0; i + 2 < indices.Length; i += 3)
-            {
-                if (IsTriangleInsideMask(mask, indices[i], indices[i + 1], indices[i + 2]))
-                    total++;
-            }
-        }
-
-        return total;
     }
 
     private static bool IsTriangleInsideMask(bool[] mask, int a, int b, int c)
