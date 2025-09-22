@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.IO;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -95,13 +94,8 @@ public static class MeshPolygonReducer
             EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
             newMesh.name = originalMesh.name + "_reduced";
 
-            var meshPath = AssetDatabase.GetAssetPath(originalMesh);
-            if (!string.IsNullOrEmpty(meshPath))
+            if (MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "reduced", out var newPath))
             {
-                var directory = Path.GetDirectoryName(meshPath);
-                var name = Path.GetFileNameWithoutExtension(meshPath) + "_reduced.asset";
-                var newPath = AssetDatabase.GenerateUniqueAssetPath(Path.Combine(directory, name));
-                AssetDatabase.CreateAsset(newMesh, newPath);
                 assetCreated = true;
                 renderer.sharedMesh = AssetDatabase.LoadAssetAtPath<Mesh>(newPath);
             }
