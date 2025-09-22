@@ -5,15 +5,19 @@ using UnityEngine.Rendering;
 
 internal sealed class ArapMeshSimplifier
 {
-    private const float MinimumTriangleArea = 1e-10f;
-    private const float NormalAlignmentThreshold = -0.2f;
+    // 改良: トポロジ判定を厳しくし、極端な潰れや法線反転を防ぐ
+    private const float MinimumTriangleArea = 1e-8f;
+    private const float NormalAlignmentThreshold = 0.0f;
     private const float CotangentEpsilon = 1e-6f;
     private const float PolarTolerance = 1e-6f;
     private const int PolarIterations = 10;
-    private const int MaxArapIterations = 10;
+    // 改良: ARAP の反復と収束閾値を強化して形状復元を優先
+    private const int MaxArapIterations = 30;
     private const int MaxConjugateGradientIterations = 512;
-    private const float ConjugateGradientTolerance = 1e-6f;
+    private const float ConjugateGradientTolerance = 1e-8f;
     private const float BoneWeightCompatibilityThreshold = 0.1f;
+    // 改良: 元座標との差を強く抑制するためのペナルティ係数
+    private const float OriginalPositionPenaltyWeight = 250f;
 
     private readonly Mesh sourceMesh;
     private readonly bool[] vertexMask;
@@ -52,6 +56,8 @@ internal sealed class ArapMeshSimplifier
         public HashSet<int> IncidentTriangles = new HashSet<int>();
         public List<int> SourceIndices = new List<int>();
         public int AggregateWeight = 1;
+        public Vector3 OriginalPositionSum;
+        public float OriginalPositionSquaredSum;
         public bool Removed;
         public bool Locked;
         public bool Candidate;
@@ -448,6 +454,8 @@ internal sealed class ArapMeshSimplifier
                 Locked = !candidate,
                 Candidate = candidate,
                 AggregateWeight = 1,
+                OriginalPositionSum = sourceVertices[i],
+                OriginalPositionSquaredSum = sourceVertices[i].sqrMagnitude,
                 Quadric = SymmetricMatrix.Zero,
                 Revision = 0
             };
@@ -618,33 +626,38 @@ internal sealed class ArapMeshSimplifier
             return false;
 
         SymmetricMatrix quadric = va.Quadric + vb.Quadric;
-        Vector3 optimal;
-        if (!quadric.TryGetOptimalPosition(out optimal))
+
+        // 改良: 元座標からの乖離を強く抑えるコスト評価
+        Vector3 bestPosition = Vector3.zero;
+        float bestCost = float.PositiveInfinity;
+
+        void ConsiderPosition(Vector3 position)
         {
-            Vector3 mid = (va.Position + vb.Position) * 0.5f;
-            double costMid = quadric.Evaluate(mid);
-            double costA = quadric.Evaluate(va.Position);
-            double costB = quadric.Evaluate(vb.Position);
-            double minCost = costMid;
-            optimal = mid;
-            if (costA < minCost)
+            if (!IsValidVector(position))
+                return;
+            float evaluatedCost = EvaluateEdgeCost(quadric, position, va, vb);
+            if (evaluatedCost < bestCost)
             {
-                minCost = costA;
-                optimal = va.Position;
-            }
-            if (costB < minCost)
-            {
-                minCost = costB;
-                optimal = vb.Position;
+                bestCost = evaluatedCost;
+                bestPosition = position;
             }
         }
-        float cost = (float)quadric.Evaluate(optimal);
+
+        if (quadric.TryGetOptimalPosition(out Vector3 optimal) && IsValidVector(optimal))
+            ConsiderPosition(optimal);
+        ConsiderPosition((va.Position + vb.Position) * 0.5f);
+        ConsiderPosition(va.Position);
+        ConsiderPosition(vb.Position);
+
+        if (!IsValidVector(bestPosition) || float.IsInfinity(bestCost))
+            return false;
+
         candidate = new EdgeCandidate
         {
             A = a,
             B = b,
-            Cost = cost,
-            OptimalPosition = optimal,
+            Cost = bestCost,
+            OptimalPosition = bestPosition,
             RevisionA = va.Revision,
             RevisionB = vb.Revision
         };
@@ -784,6 +797,8 @@ internal sealed class ArapMeshSimplifier
                           Mathf.Max(1, target.AggregateWeight + source.AggregateWeight);
         target.RestPosition = newRest;
         target.AggregateWeight += source.AggregateWeight;
+        target.OriginalPositionSum += source.OriginalPositionSum;
+        target.OriginalPositionSquaredSum += source.OriginalPositionSquaredSum;
         target.Locked |= source.Locked;
         target.Candidate |= source.Candidate;
         target.Quadric = target.Quadric + source.Quadric;
@@ -978,6 +993,21 @@ internal sealed class ArapMeshSimplifier
 
             SolveGlobalStep(weights, rhs);
         }
+    }
+
+    private float EvaluateEdgeCost(SymmetricMatrix quadric, Vector3 position, VertexData va, VertexData vb)
+    {
+        double quadricCost = quadric.Evaluate(position);
+        int combinedWeight = Mathf.Max(va.AggregateWeight + vb.AggregateWeight, 1);
+        Vector3 originalSum = va.OriginalPositionSum + vb.OriginalPositionSum;
+        float originalSquaredSum = va.OriginalPositionSquaredSum + vb.OriginalPositionSquaredSum;
+        float penalty = 0f;
+        float positionMagnitude = position.sqrMagnitude;
+        float sumSquaredDistance = combinedWeight * positionMagnitude - 2f * Vector3.Dot(position, originalSum) + originalSquaredSum;
+        if (combinedWeight > 0)
+            penalty = sumSquaredDistance / combinedWeight;
+
+        return (float)quadricCost + OriginalPositionPenaltyWeight * penalty;
     }
 
     private Dictionary<int, float>[] BuildCotangentWeights()
