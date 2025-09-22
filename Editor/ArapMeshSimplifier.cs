@@ -665,8 +665,16 @@ internal sealed class ArapMeshSimplifier
         var source = vertices[sourceIndex];
 
         Vector3 newPosition = candidate.OptimalPosition;
+        if (!IsValidVector(newPosition))
+            newPosition = Vector3.Lerp(va.Position, vb.Position, 0.5f);
+        if (!IsValidVector(newPosition))
+            newPosition = target.Position;
         if (target.Locked)
             newPosition = target.Position;
+        if (!IsValidVector(newPosition))
+            newPosition = source.Position;
+        if (!IsValidVector(newPosition))
+            newPosition = Vector3.zero;
 
         if (!IsCollapseTopologicallyValid(targetIndex, sourceIndex, newPosition))
             return false;
@@ -1074,6 +1082,12 @@ internal sealed class ArapMeshSimplifier
         return v / mag;
     }
 
+    private static bool IsValidVector(Vector3 v)
+    {
+        return !(float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z) ||
+                 float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z));
+    }
+
     private void SolveGlobalStep(Dictionary<int, float>[] weights, Vector3[] rhs)
     {
         List<int> freeVertices = new List<int>();
@@ -1156,7 +1170,10 @@ internal sealed class ArapMeshSimplifier
         for (int idx = 0; idx < n; idx++)
         {
             int vi = freeVertices[idx];
-            vertices[vi].Position = new Vector3(solutionX[idx], solutionY[idx], solutionZ[idx]);
+            Vector3 newPos = new Vector3(solutionX[idx], solutionY[idx], solutionZ[idx]);
+            if (!IsValidVector(newPos))
+                newPos = vertices[vi].RestPosition;
+            vertices[vi].Position = newPos;
         }
     }
 
@@ -1256,7 +1273,12 @@ internal sealed class ArapMeshSimplifier
             if (v == null || v.Removed)
                 continue;
             int dst = map[i];
-            newVertices[dst] = v.Position;
+            Vector3 finalPosition = v.Position;
+            if (!IsValidVector(finalPosition))
+                finalPosition = v.RestPosition;
+            if (!IsValidVector(finalPosition))
+                finalPosition = Vector3.zero;
+            newVertices[dst] = finalPosition;
             if (newNormals != null)
             {
                 Vector3 normal = v.NormalSum;
