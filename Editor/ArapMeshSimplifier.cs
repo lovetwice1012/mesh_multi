@@ -13,6 +13,7 @@ internal sealed class ArapMeshSimplifier
     private const int MaxArapIterations = 10;
     private const int MaxConjugateGradientIterations = 512;
     private const float ConjugateGradientTolerance = 1e-6f;
+    private const float BoneWeightCompatibilityThreshold = 0.1f;
 
     private readonly Mesh sourceMesh;
     private readonly bool[] vertexMask;
@@ -613,6 +614,9 @@ internal sealed class ArapMeshSimplifier
         if (va.Locked && vb.Locked)
             return false;
 
+        if (!AreBoneWeightsCompatible(va, vb))
+            return false;
+
         SymmetricMatrix quadric = va.Quadric + vb.Quadric;
         Vector3 optimal;
         if (!quadric.TryGetOptimalPosition(out optimal))
@@ -681,6 +685,40 @@ internal sealed class ArapMeshSimplifier
 
         MergeVertices(targetIndex, sourceIndex, newPosition);
         return true;
+    }
+
+    private bool AreBoneWeightsCompatible(VertexData a, VertexData b)
+    {
+        if (a == null || b == null)
+            return false;
+        if (a.BoneWeights == null || b.BoneWeights == null)
+            return true;
+        if (a.BoneWeights.Count == 0 || b.BoneWeights.Count == 0)
+            return true;
+
+        float totalA = 0f;
+        foreach (var kv in a.BoneWeights)
+            totalA += kv.Value;
+
+        float totalB = 0f;
+        foreach (var kv in b.BoneWeights)
+            totalB += kv.Value;
+
+        if (totalA <= 0f || totalB <= 0f)
+            return true;
+
+        float shared = 0f;
+        foreach (var kv in a.BoneWeights)
+        {
+            if (!b.BoneWeights.TryGetValue(kv.Key, out float weightB))
+                continue;
+
+            float weightA = kv.Value / totalA;
+            float normalisedB = weightB / totalB;
+            shared += Mathf.Min(weightA, normalisedB);
+        }
+
+        return shared >= BoneWeightCompatibilityThreshold;
     }
 
     private bool IsCollapseTopologicallyValid(int target, int source, Vector3 newPosition)
@@ -1326,7 +1364,7 @@ internal sealed class ArapMeshSimplifier
         if (newBoneWeights != null)
             mesh.boneWeights = newBoneWeights;
         if (sourceMesh.bindposes != null && sourceMesh.bindposes.Length > 0)
-            mesh.bindposes = sourceMesh.bindposes;
+            mesh.bindposes = (Matrix4x4[])sourceMesh.bindposes.Clone();
         for (int channel = 0; channel < uvChannels.Length; channel++)
         {
             if (uvChannels[channel] != null)
@@ -1371,6 +1409,14 @@ internal sealed class ArapMeshSimplifier
         }
 
         mesh.RecalculateBounds();
+        Bounds combinedBounds = mesh.bounds;
+        Bounds sourceBounds = sourceMesh.bounds;
+        if (sourceBounds.size.sqrMagnitude > 0f)
+        {
+            combinedBounds.Encapsulate(sourceBounds.min);
+            combinedBounds.Encapsulate(sourceBounds.max);
+        }
+        mesh.bounds = combinedBounds;
         if (mesh.normals == null || mesh.normals.Length == 0)
             mesh.RecalculateNormals();
         if (mesh.tangents == null || mesh.tangents.Length == 0)
