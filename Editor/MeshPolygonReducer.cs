@@ -136,6 +136,10 @@ public static class MeshPolygonReducer
         if (vertexCount < 3)
             return null;
 
+        int originalTriangles = CountTotalTriangles(mesh);
+        if (originalTriangles <= 0)
+            return null;
+
         bool useMask = vertexMask != null && vertexMask.Length == vertexCount;
         int candidateVertices = 0;
         if (useMask)
@@ -157,6 +161,7 @@ public static class MeshPolygonReducer
         if (reductionRatio <= 0f)
             return null;
 
+        int targetTriangles = Mathf.Max(1, originalTriangles - Mathf.RoundToInt(originalTriangles * reductionRatio));
         int desiredCandidateVertices = Mathf.Max(3, candidateVertices - Mathf.RoundToInt(candidateVertices * reductionRatio));
         if (desiredCandidateVertices >= candidateVertices)
             return null;
@@ -176,6 +181,14 @@ public static class MeshPolygonReducer
             int target = (low + high) / 2;
             if (TrySimplify(mesh, vertexMask, target, out var simplified))
             {
+                int simplifiedTriangles = CountTotalTriangles(simplified);
+                if (simplifiedTriangles < targetTriangles)
+                {
+                    UnityEngine.Object.DestroyImmediate(simplified);
+                    low = target + 1;
+                    continue;
+                }
+
                 if (bestMesh != null)
                     UnityEngine.Object.DestroyImmediate(bestMesh);
 
@@ -210,6 +223,28 @@ public static class MeshPolygonReducer
 
         simplified = null;
         return false;
+    }
+
+    private static int CountTotalTriangles(Mesh mesh)
+    {
+        if (mesh == null)
+            return 0;
+
+        int subMeshCount = mesh.subMeshCount;
+        if (subMeshCount <= 0)
+        {
+            var tris = mesh.triangles;
+            return tris != null ? tris.Length / 3 : 0;
+        }
+
+        int total = 0;
+        for (int i = 0; i < subMeshCount; i++)
+        {
+            var tris = mesh.GetTriangles(i);
+            total += tris.Length / 3;
+        }
+
+        return total;
     }
 }
 
