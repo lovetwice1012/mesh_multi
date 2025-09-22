@@ -59,55 +59,68 @@ public static class MeshMulti
         }
 
         int total = targetRenderers.Count;
-        for (int i = 0; i < total; i++)
+        bool createdAsset = false;
+        try
         {
-            var renderer = targetRenderers[i];
-            EditorUtility.DisplayProgressBar("Subdivide Meshes", $"Processing {i + 1}/{total}: {renderer.name}", (float)i / total);
-
-            var originalMesh = renderer.sharedMesh;
-            if (originalMesh == null)
-                continue;
-
-            bool[] subdivisionMaskInput = null;
-            if (limitBounds.HasValue)
-                subdivisionMaskInput = CalculateVerticesInsideBounds(renderer, originalMesh, limitBounds.Value);
-
-            bool[] subdivisionMask;
-            var newMesh = SubdivideMesh(originalMesh, subdivisionMaskInput, out subdivisionMask);
-            if (smooth)
+            for (int i = 0; i < total; i++)
             {
-                bool[] smoothedVertices = null;
+                var renderer = targetRenderers[i];
+                EditorUtility.DisplayProgressBar("Subdivide Meshes", $"Processing {i + 1}/{total}: {renderer.name}", (float)i / total);
+
+                var originalMesh = renderer.sharedMesh;
+                if (originalMesh == null)
+                    continue;
+
+                bool[] subdivisionMaskInput = null;
                 if (limitBounds.HasValue)
+                    subdivisionMaskInput = CalculateVerticesInsideBounds(renderer, originalMesh, limitBounds.Value);
+
+                bool[] subdivisionMask;
+                var newMesh = SubdivideMesh(originalMesh, subdivisionMaskInput, out subdivisionMask);
+                if (smooth)
                 {
-                    smoothedVertices = CalculateVerticesInsideBounds(renderer, newMesh, limitBounds.Value);
-                    if (subdivisionMask != null && smoothedVertices != null)
+                    bool[] smoothedVertices = null;
+                    if (limitBounds.HasValue)
                     {
-                        int count = Mathf.Min(subdivisionMask.Length, smoothedVertices.Length);
-                        for (int v = 0; v < count; v++)
-                            smoothedVertices[v] = smoothedVertices[v] || subdivisionMask[v];
+                        smoothedVertices = CalculateVerticesInsideBounds(renderer, newMesh, limitBounds.Value);
+                        if (subdivisionMask != null && smoothedVertices != null)
+                        {
+                            int count = Mathf.Min(subdivisionMask.Length, smoothedVertices.Length);
+                            for (int v = 0; v < count; v++)
+                                smoothedVertices[v] = smoothedVertices[v] || subdivisionMask[v];
+                        }
                     }
+                    ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total, smoothedVertices);
                 }
-                ThinPlateSmooth(newMesh, smoothIterations, 0.1f, i, total, smoothedVertices);
-            }
 
-            float percent = ((float)(i + 1) / total) * 100f;
-            percent = Mathf.Floor(percent * 1000f) / 1000f;
-            EditorUtility.DisplayProgressBar("Subdivide Meshes", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
-            newMesh.name = originalMesh.name + "_subdivided";
+                float percent = ((float)(i + 1) / total) * 100f;
+                percent = Mathf.Floor(percent * 1000f) / 1000f;
+                EditorUtility.DisplayProgressBar("Subdivide Meshes", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
+                newMesh.name = originalMesh.name + "_subdivided";
 
-            if (MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "subdivided", out var newPath))
-            {
-                AssetDatabase.SaveAssets();
-                renderer.sharedMesh = AssetDatabase.LoadAssetAtPath<Mesh>(newPath);
-            }
-            else
-            {
-                renderer.sharedMesh = newMesh;
-            }
+                if (MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "subdivided", out var newPath))
+                {
+                    createdAsset = true;
+                    renderer.sharedMesh = AssetDatabase.LoadAssetAtPath<Mesh>(newPath);
+                }
+                else
+                {
+                    renderer.sharedMesh = newMesh;
+                }
 
-            EditorUtility.SetDirty(renderer);
+                EditorUtility.SetDirty(renderer);
+            }
         }
-        EditorUtility.ClearProgressBar();
+        finally
+        {
+            EditorUtility.ClearProgressBar();
+        }
+
+        if (createdAsset)
+        {
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+        }
 
         float finalPercent = Mathf.Floor(100f * 1000f) / 1000f;
         Debug.Log(string.Format("Subdivided {0} meshes under '{1}' ({2:F3}%).", targetRenderers.Count, selected.name, finalPercent));
