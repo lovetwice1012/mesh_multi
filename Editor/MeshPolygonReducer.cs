@@ -4,6 +4,7 @@ using System.IO;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEditor.SceneManagement;
 
 public static class MeshPolygonReducer
 {
@@ -81,6 +82,8 @@ public static class MeshPolygonReducer
             if (limitBounds.HasValue)
                 vertexMask = MeshMulti.CalculateVerticesInsideBounds(renderer, originalMesh, limitBounds.Value);
 
+            Undo.RegisterCompleteObjectUndo(renderer, "Reduce Skinned Mesh Polygons");
+
             var newMesh = ReduceMesh(originalMesh, reductionRatio, vertexMask, seed);
             if (newMesh == null)
                 continue;
@@ -106,6 +109,9 @@ public static class MeshPolygonReducer
             }
 
             EditorUtility.SetDirty(renderer);
+            if (renderer.sharedMesh != null)
+                EditorUtility.SetDirty(renderer.sharedMesh);
+            EditorSceneManager.MarkSceneDirty(renderer.gameObject.scene);
         }
 
         EditorUtility.ClearProgressBar();
