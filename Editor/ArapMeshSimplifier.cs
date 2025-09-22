@@ -687,12 +687,21 @@ internal sealed class ArapMeshSimplifier
             var tri = triangles[triIndex];
             if (tri.Removed)
                 continue;
+
+            bool usesSource = tri.A == source || tri.B == source || tri.C == source;
+            bool usesTargetOriginal = tri.A == target || tri.B == target || tri.C == target;
+            bool collapsesTriangle = usesSource && usesTargetOriginal;
+
             int a = tri.A;
             int b = tri.B;
             int c = tri.C;
             if (a == source) a = target;
             if (b == source) b = target;
             if (c == source) c = target;
+
+            if (collapsesTriangle)
+                continue;
+
             if (a == b || b == c || c == a)
                 return false;
 
