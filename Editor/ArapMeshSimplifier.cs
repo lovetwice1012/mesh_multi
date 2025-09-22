@@ -33,6 +33,9 @@ internal sealed class ArapMeshSimplifier
     private readonly Color[] sourceColors;
     private readonly BoneWeight[] sourceBoneWeights;
     private readonly Vector2[][] sourceUVs;
+    private readonly MeshTopology[] sourceSubmeshTopologies;
+    private readonly int[][] sourceSubmeshIndices;
+    private readonly bool[] topologyLockedVertices;
 
     private VertexData[] vertices;
     private List<TriangleData> triangles;
@@ -69,6 +72,7 @@ internal sealed class ArapMeshSimplifier
         public HashSet<int> Neighbors = new HashSet<int>();
         public HashSet<int> IncidentTriangles = new HashSet<int>();
         public List<int> SourceIndices = new List<int>();
+        public List<float> SourceWeights = new List<float>();
         public int AggregateWeight = 1;
         public Vector3 OriginalPositionSum;
         public float OriginalPositionSquaredSum;
@@ -477,9 +481,7 @@ internal sealed class ArapMeshSimplifier
 
     public ArapMeshSimplifier(Mesh mesh, bool[] mask, int? seed = null)
     {
-        sourceMesh = mesh;
-        if (mesh == null)
-            throw new ArgumentNullException(nameof(mesh));
+        sourceMesh = mesh ?? throw new ArgumentNullException(nameof(mesh));
 
         if (mask != null && mask.Length != mesh.vertexCount)
         {
@@ -491,12 +493,20 @@ internal sealed class ArapMeshSimplifier
             vertexMask = mask;
         }
         randomSeed = seed;
-        sourceVertices = mesh.vertices;
-        sourceNormals = mesh.normals;
-        sourceTangents = mesh.tangents;
-        sourceColors = mesh.colors;
-        sourceBoneWeights = mesh.boneWeights;
-        sourceUVs = GetUVChannels(mesh);
+        using (var meshDataArray = Mesh.AcquireReadOnlyMeshData(mesh))
+        {
+            if (meshDataArray.Length == 0)
+                throw new InvalidOperationException($"Failed to acquire read-only mesh data for '{mesh.name}'.");
+
+            var meshData = meshDataArray[0];
+            sourceVertices = ReadVertices(meshData);
+            sourceNormals = ReadNormals(meshData);
+            sourceTangents = ReadTangents(meshData);
+            sourceColors = ReadColors(meshData);
+            sourceBoneWeights = ReadBoneWeights(meshData);
+            sourceUVs = ReadUVChannels(meshData);
+            (sourceSubmeshTopologies, sourceSubmeshIndices, topologyLockedVertices) = ReadSubmeshData(mesh, meshData);
+        }
     }
 
     public Result? Simplify(int targetCandidateCount)
@@ -533,20 +543,33 @@ internal sealed class ArapMeshSimplifier
 
         for (int i = 0; i < vertexCount; i++)
         {
-            bool candidate = vertexMask == null || vertexMask[i];
+            bool lockedByTopology = topologyLockedVertices != null && topologyLockedVertices.Length > i && topologyLockedVertices[i];
+            bool candidate = (vertexMask == null || vertexMask[i]) && !lockedByTopology;
             baseVertices[i] = CreateInitialVertex(i, candidate);
             if (candidate)
                 baseCandidateVertexCount++;
+            else if (lockedByTopology)
+                baseVertices[i].Locked = true;
         }
 
         baseTriangles = new List<TriangleData>();
-        int subMeshCount = Mathf.Max(1, sourceMesh.subMeshCount);
+        int subMeshCount = sourceSubmeshTopologies != null && sourceSubmeshTopologies.Length > 0
+            ? sourceSubmeshTopologies.Length
+            : Mathf.Max(1, sourceMesh.subMeshCount);
         baseSubmeshTriangleIndices = new List<int>[subMeshCount];
         for (int sub = 0; sub < subMeshCount; sub++)
         {
             baseSubmeshTriangleIndices[sub] = new List<int>();
-            int[] indices = (sourceMesh.subMeshCount == 0 && sub == 0) ? sourceMesh.triangles : sourceMesh.GetTriangles(sub);
-            for (int i = 0; i < indices.Length; i += 3)
+            MeshTopology topology = (sourceSubmeshTopologies != null && sub < sourceSubmeshTopologies.Length)
+                ? sourceSubmeshTopologies[sub]
+                : MeshTopology.Triangles;
+            if (topology != MeshTopology.Triangles)
+                continue;
+
+            int[] indices = (sourceSubmeshIndices != null && sub < sourceSubmeshIndices.Length && sourceSubmeshIndices[sub] != null)
+                ? sourceSubmeshIndices[sub]
+                : Array.Empty<int>();
+            for (int i = 0; i + 2 < indices.Length; i += 3)
             {
                 int a = indices[i];
                 int b = indices[i + 1];
@@ -630,6 +653,7 @@ internal sealed class ArapMeshSimplifier
         }
 
         data.SourceIndices.Add(index);
+        data.SourceWeights.Add(1f);
         return data;
     }
 
@@ -692,6 +716,7 @@ internal sealed class ArapMeshSimplifier
         clone.Neighbors = new HashSet<int>(source.Neighbors);
         clone.IncidentTriangles = new HashSet<int>(source.IncidentTriangles);
         clone.SourceIndices = new List<int>(source.SourceIndices);
+        clone.SourceWeights = new List<float>(source.SourceWeights);
         return clone;
     }
 
@@ -1014,6 +1039,12 @@ internal sealed class ArapMeshSimplifier
         target.Candidate |= source.Candidate;
         target.Quadric = target.Quadric + source.Quadric;
         target.SourceIndices.AddRange(source.SourceIndices);
+        if (source.SourceWeights != null && source.SourceWeights.Count > 0)
+        {
+            if (target.SourceWeights == null)
+                target.SourceWeights = new List<float>(source.SourceWeights.Count);
+            target.SourceWeights.AddRange(source.SourceWeights);
+        }
         target.NormalSum += source.NormalSum;
         target.TangentSum += source.TangentSum;
         target.ColorSum += source.ColorSum;
@@ -1583,6 +1614,7 @@ internal sealed class ArapMeshSimplifier
         }
 
         var vertexSources = new List<int>[vertexCount];
+        var vertexSourceWeights = new List<float>[vertexCount];
 
         for (int i = 0; i < vertices.Length; i++)
         {
@@ -1629,7 +1661,9 @@ internal sealed class ArapMeshSimplifier
                 else
                     uvChannels[channel].Add(Vector2.zero);
             }
-            vertexSources[dst] = v.SourceIndices;
+            vertexSources[dst] = v.SourceIndices != null ? new List<int>(v.SourceIndices) : null;
+            if (v.SourceWeights != null && v.SourceWeights.Count > 0)
+                vertexSourceWeights[dst] = new List<float>(v.SourceWeights);
         }
 
         mesh.indexFormat = vertexCount > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
@@ -1650,12 +1684,50 @@ internal sealed class ArapMeshSimplifier
                 mesh.SetUVs(channel, uvChannels[channel]);
         }
 
-        CopyBlendShapesToMesh(mesh, vertexSources);
+        CopyBlendShapesToMesh(mesh, vertexSources, vertexSourceWeights);
 
         mesh.subMeshCount = submeshTriangleIndices.Length;
         bool anyTriangles = false;
         for (int sub = 0; sub < submeshTriangleIndices.Length; sub++)
         {
+            MeshTopology topology = (sourceSubmeshTopologies != null && sub < sourceSubmeshTopologies.Length)
+                ? sourceSubmeshTopologies[sub]
+                : MeshTopology.Triangles;
+            if (topology != MeshTopology.Triangles)
+            {
+                var originalIndices = (sourceSubmeshIndices != null && sub < sourceSubmeshIndices.Length)
+                    ? sourceSubmeshIndices[sub]
+                    : null;
+                if (originalIndices == null || originalIndices.Length == 0)
+                {
+                    mesh.SetIndices(Array.Empty<int>(), topology, sub, true);
+                    continue;
+                }
+
+                int[] remapped = new int[originalIndices.Length];
+                int validCount = 0;
+                for (int i = 0; i < originalIndices.Length; i++)
+                {
+                    int originalIndex = originalIndices[i];
+                    int mapped = (originalIndex >= 0 && originalIndex < map.Length) ? map[originalIndex] : -1;
+                    if (mapped < 0)
+                        continue;
+                    remapped[validCount++] = mapped;
+                }
+
+                if (validCount == 0)
+                {
+                    mesh.SetIndices(Array.Empty<int>(), topology, sub, true);
+                }
+                else
+                {
+                    if (validCount != remapped.Length)
+                        Array.Resize(ref remapped, validCount);
+                    mesh.SetIndices(remapped, topology, sub, true);
+                }
+                continue;
+            }
+
             var list = submeshTriangleIndices[sub];
             List<int> indices = new List<int>();
             foreach (int triIndex in list)
@@ -1707,7 +1779,7 @@ internal sealed class ArapMeshSimplifier
         return mesh;
     }
 
-    private void CopyBlendShapesToMesh(Mesh mesh, List<int>[] vertexSources)
+    private void CopyBlendShapesToMesh(Mesh mesh, List<int>[] vertexSources, List<float>[] vertexSourceWeights)
     {
         int blendShapeCount = sourceMesh.blendShapeCount;
         if (blendShapeCount == 0)
@@ -1738,19 +1810,38 @@ internal sealed class ArapMeshSimplifier
                     var sources = vertexSources[v];
                     if (sources == null || sources.Count == 0)
                         continue;
+                    var weights = vertexSourceWeights != null && vertexSourceWeights.Length > v ? vertexSourceWeights[v] : null;
                     Vector3 accumDelta = Vector3.zero;
                     Vector3 accumNormal = Vector3.zero;
                     Vector3 accumTangent = Vector3.zero;
-                    foreach (int src in sources)
+                    float weightSum = 0f;
+                    for (int s = 0; s < sources.Count; s++)
                     {
-                        accumDelta += deltaVertices[src];
-                        accumNormal += deltaNormals[src];
-                        accumTangent += deltaTangents[src];
+                        int src = sources[s];
+                        float weight = 1f;
+                        if (weights != null && s < weights.Count)
+                            weight = weights[s];
+                        if (weight <= 0f)
+                            continue;
+                        accumDelta += deltaVertices[src] * weight;
+                        accumNormal += deltaNormals[src] * weight;
+                        accumTangent += deltaTangents[src] * weight;
+                        weightSum += weight;
                     }
-                    float inv = 1f / Mathf.Max(1, sources.Count);
-                    newDeltaVertices[v] = accumDelta * inv;
-                    newDeltaNormals[v] = accumNormal * inv;
-                    newDeltaTangents[v] = accumTangent * inv;
+                    if (weightSum <= 0f)
+                    {
+                        float invSources = 1f / Mathf.Max(1, sources.Count);
+                        newDeltaVertices[v] = accumDelta * invSources;
+                        newDeltaNormals[v] = accumNormal * invSources;
+                        newDeltaTangents[v] = accumTangent * invSources;
+                    }
+                    else
+                    {
+                        float inv = 1f / weightSum;
+                        newDeltaVertices[v] = accumDelta * inv;
+                        newDeltaNormals[v] = accumNormal * inv;
+                        newDeltaTangents[v] = accumTangent * inv;
+                    }
                 }
 
                 mesh.AddBlendShapeFrame(shapeName, weight, newDeltaVertices, newDeltaNormals, newDeltaTangents);
@@ -1807,19 +1898,249 @@ internal sealed class ArapMeshSimplifier
         return bw;
     }
 
-    private static Vector2[][] GetUVChannels(Mesh mesh)
+    private static Vector3[] ReadVertices(Mesh.MeshData meshData)
     {
-        Vector2[][] channels = new Vector2[8][];
-        channels[0] = mesh.uv;
-        channels[1] = mesh.uv2;
-        channels[2] = mesh.uv3;
-        channels[3] = mesh.uv4;
-#if UNITY_2018_2_OR_NEWER
-        channels[4] = mesh.uv5;
-        channels[5] = mesh.uv6;
-        channels[6] = mesh.uv7;
-        channels[7] = mesh.uv8;
-#endif
+        int count = meshData.vertexCount;
+        var result = new Vector3[count];
+        if (count == 0)
+            return result;
+        using (var native = new NativeArray<Vector3>(count, Allocator.Temp))
+        {
+            meshData.GetVertices(native);
+            native.CopyTo(result);
+        }
+        return result;
+    }
+
+    private static Vector3[] ReadNormals(Mesh.MeshData meshData)
+    {
+        if (!meshData.HasVertexAttribute(VertexAttribute.Normal))
+            return null;
+        int count = meshData.vertexCount;
+        var result = new Vector3[count];
+        if (count == 0)
+            return result;
+        using (var native = new NativeArray<Vector3>(count, Allocator.Temp))
+        {
+            meshData.GetNormals(native);
+            native.CopyTo(result);
+        }
+        return result;
+    }
+
+    private static Vector4[] ReadTangents(Mesh.MeshData meshData)
+    {
+        if (!meshData.HasVertexAttribute(VertexAttribute.Tangent))
+            return null;
+        int count = meshData.vertexCount;
+        var result = new Vector4[count];
+        if (count == 0)
+            return result;
+        using (var native = new NativeArray<Vector4>(count, Allocator.Temp))
+        {
+            meshData.GetTangents(native);
+            native.CopyTo(result);
+        }
+        return result;
+    }
+
+    private static Color[] ReadColors(Mesh.MeshData meshData)
+    {
+        if (!meshData.HasVertexAttribute(VertexAttribute.Color))
+            return null;
+        int count = meshData.vertexCount;
+        var result = new Color[count];
+        if (count == 0)
+            return result;
+        try
+        {
+            using (var native = new NativeArray<Color>(count, Allocator.Temp))
+            {
+                meshData.GetColors(native);
+                native.CopyTo(result);
+            }
+        }
+        catch
+        {
+            using (var native32 = new NativeArray<Color32>(count, Allocator.Temp))
+            {
+                meshData.GetColors(native32);
+                for (int i = 0; i < count; i++)
+                    result[i] = native32[i];
+            }
+        }
+        return result;
+    }
+
+    private static BoneWeight[] ReadBoneWeights(Mesh.MeshData meshData)
+    {
+        if (!meshData.HasVertexAttribute(VertexAttribute.BlendWeight) ||
+            !meshData.HasVertexAttribute(VertexAttribute.BlendIndices))
+            return null;
+
+        int vertexCount = meshData.vertexCount;
+        if (vertexCount == 0)
+            return Array.Empty<BoneWeight>();
+
+        var result = new BoneWeight[vertexCount];
+        var bonesPerVertex = meshData.GetBonesPerVertex();
+        var allWeights = meshData.GetAllBoneWeights();
+        try
+        {
+            if (!bonesPerVertex.IsCreated || !allWeights.IsCreated || bonesPerVertex.Length == 0)
+                return result;
+
+            int weightOffset = 0;
+            for (int i = 0; i < vertexCount; i++)
+            {
+                int boneCount = i < bonesPerVertex.Length ? bonesPerVertex[i] : 0;
+                boneCount = Mathf.Clamp(boneCount, 0, Mathf.Max(0, allWeights.Length - weightOffset));
+                BoneWeight bw = new BoneWeight();
+                for (int b = 0; b < boneCount && b < 4; b++)
+                {
+                    var boneWeight = allWeights[weightOffset + b];
+                    switch (b)
+                    {
+                        case 0:
+                            bw.boneIndex0 = boneWeight.boneIndex;
+                            bw.weight0 = boneWeight.weight;
+                            break;
+                        case 1:
+                            bw.boneIndex1 = boneWeight.boneIndex;
+                            bw.weight1 = boneWeight.weight;
+                            break;
+                        case 2:
+                            bw.boneIndex2 = boneWeight.boneIndex;
+                            bw.weight2 = boneWeight.weight;
+                            break;
+                        case 3:
+                            bw.boneIndex3 = boneWeight.boneIndex;
+                            bw.weight3 = boneWeight.weight;
+                            break;
+                    }
+                }
+                NormalizeBoneWeight(ref bw);
+                result[i] = bw;
+                weightOffset += boneCount;
+            }
+        }
+        finally
+        {
+            if (bonesPerVertex.IsCreated)
+                bonesPerVertex.Dispose();
+            if (allWeights.IsCreated)
+                allWeights.Dispose();
+        }
+
+        return result;
+    }
+
+    private static void NormalizeBoneWeight(ref BoneWeight weight)
+    {
+        float total = weight.weight0 + weight.weight1 + weight.weight2 + weight.weight3;
+        if (total <= 0f)
+            return;
+        float inv = 1f / total;
+        weight.weight0 *= inv;
+        weight.weight1 *= inv;
+        weight.weight2 *= inv;
+        weight.weight3 *= inv;
+    }
+
+    private static Vector2[][] ReadUVChannels(Mesh.MeshData meshData)
+    {
+        const int MaxChannels = 8;
+        var channels = new Vector2[MaxChannels][];
+        int vertexCount = meshData.vertexCount;
+        for (int channel = 0; channel < MaxChannels; channel++)
+        {
+            var attribute = (VertexAttribute)((int)VertexAttribute.TexCoord0 + channel);
+            if (!meshData.HasVertexAttribute(attribute))
+            {
+                channels[channel] = null;
+                continue;
+            }
+
+            if (vertexCount == 0)
+            {
+                channels[channel] = Array.Empty<Vector2>();
+                continue;
+            }
+
+            using (var native = new NativeArray<Vector2>(vertexCount, Allocator.Temp))
+            {
+                meshData.GetUVs(channel, native);
+                var array = new Vector2[vertexCount];
+                native.CopyTo(array);
+                channels[channel] = array;
+            }
+        }
         return channels;
+    }
+
+    private static (MeshTopology[] topologies, int[][] indices, bool[] lockedVertices) ReadSubmeshData(Mesh mesh, Mesh.MeshData meshData)
+    {
+        int meshSubMeshCount = mesh.subMeshCount;
+        int dataSubMeshCount = meshData.subMeshCount;
+        int subMeshCount = Mathf.Max(1, Mathf.Max(meshSubMeshCount, dataSubMeshCount));
+
+        var topologies = new MeshTopology[subMeshCount];
+        var indices = new int[subMeshCount][];
+        var lockedVertices = new bool[meshData.vertexCount];
+
+        for (int sub = 0; sub < subMeshCount; sub++)
+        {
+            MeshTopology topology;
+            if (meshSubMeshCount > 0 && sub < meshSubMeshCount)
+            {
+                topology = mesh.GetTopology(sub);
+            }
+            else if (sub < dataSubMeshCount)
+            {
+                topology = meshData.GetSubMesh(sub).topology;
+            }
+            else
+            {
+                topology = MeshTopology.Triangles;
+            }
+
+            topologies[sub] = topology;
+
+            if (sub < dataSubMeshCount)
+            {
+                var descriptor = meshData.GetSubMesh(sub);
+                if (descriptor.indexCount > 0)
+                {
+                    using (var native = new NativeArray<int>(descriptor.indexCount, Allocator.Temp))
+                    {
+                        meshData.GetIndices(native, sub);
+                        var array = new int[descriptor.indexCount];
+                        native.CopyTo(array);
+                        indices[sub] = array;
+                    }
+                }
+                else
+                {
+                    indices[sub] = Array.Empty<int>();
+                }
+            }
+            else
+            {
+                indices[sub] = Array.Empty<int>();
+            }
+
+            if (topology != MeshTopology.Triangles && indices[sub] != null)
+            {
+                var array = indices[sub];
+                for (int i = 0; i < array.Length; i++)
+                {
+                    int vertexIndex = array[i];
+                    if (vertexIndex >= 0 && vertexIndex < lockedVertices.Length)
+                        lockedVertices[vertexIndex] = true;
+                }
+            }
+        }
+
+        return (topologies, indices, lockedVertices);
     }
 }
