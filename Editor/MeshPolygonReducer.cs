@@ -25,8 +25,10 @@ public static class MeshPolygonReducer
 
         var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
         var targetRenderers = new List<SkinnedMeshRenderer>();
+        Dictionary<MaskCacheKey, bool[]> vertexMaskCache = null;
         if (limitBounds.HasValue)
         {
+            vertexMaskCache = new Dictionary<MaskCacheKey, bool[]>();
             Bounds bounds = limitBounds.Value;
             for (int i = 0; i < renderers.Length; i++)
             {
@@ -35,11 +37,11 @@ public static class MeshPolygonReducer
                 if (mesh == null)
                     continue;
 
-                var insideMask = MeshMulti.CalculateVerticesInsideBounds(renderer, mesh, bounds);
+                var mask = GetOrCreateMask(renderer, mesh, bounds, vertexMaskCache);
                 bool anyInside = false;
-                for (int v = 0; v < insideMask.Length; v++)
+                for (int v = 0; v < mask.Length; v++)
                 {
-                    if (insideMask[v])
+                    if (mask[v])
                     {
                         anyInside = true;
                         break;
@@ -70,49 +72,64 @@ public static class MeshPolygonReducer
         int total = targetRenderers.Count;
         bool assetCreated = false;
         bool anyRendererModified = false;
-        for (int i = 0; i < total; i++)
+        bool assetEditingStarted = false;
+        try
         {
-            var renderer = targetRenderers[i];
-            EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processing {i + 1}/{total}: {renderer.name}", (float)i / total);
-
-            var originalMesh = renderer.sharedMesh;
-            if (originalMesh == null)
-                continue;
-
-            bool[] vertexMask = null;
-            if (limitBounds.HasValue)
-                vertexMask = MeshMulti.CalculateVerticesInsideBounds(renderer, originalMesh, limitBounds.Value);
-
-            Undo.RegisterCompleteObjectUndo(renderer, "Reduce Skinned Mesh Polygons");
-
-            var newMesh = ReduceMesh(originalMesh, reductionRatio, vertexMask, seed);
-            if (newMesh == null)
-                continue;
-
-            float percent = ((float)(i + 1) / total) * 100f;
-            percent = Mathf.Floor(percent * 1000f) / 1000f;
-            EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
-            newMesh.name = originalMesh.name + "_reduced";
-
-            if (MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "reduced", out var newPath))
+            for (int i = 0; i < total; i++)
             {
-                assetCreated = true;
-                renderer.sharedMesh = AssetDatabase.LoadAssetAtPath<Mesh>(newPath);
-            }
-            else
-            {
-                renderer.sharedMesh = newMesh;
-            }
+                var renderer = targetRenderers[i];
+                EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processing {i + 1}/{total}: {renderer.name}", (float)i / total);
 
-            EditorUtility.SetDirty(renderer);
-            if (renderer.sharedMesh != null)
-                EditorUtility.SetDirty(renderer.sharedMesh);
-            PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
-            EditorSceneManager.MarkSceneDirty(renderer.gameObject.scene);
-            anyRendererModified = true;
+                var originalMesh = renderer.sharedMesh;
+                if (originalMesh == null)
+                    continue;
+
+                bool[] vertexMask = null;
+                if (limitBounds.HasValue)
+                    vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache);
+
+                Undo.RegisterCompleteObjectUndo(renderer, "Reduce Skinned Mesh Polygons");
+
+                var newMesh = ReduceMesh(originalMesh, reductionRatio, vertexMask, seed);
+                if (newMesh == null)
+                    continue;
+
+                float percent = ((float)(i + 1) / total) * 100f;
+                percent = Mathf.Floor(percent * 1000f) / 1000f;
+                EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
+                newMesh.name = originalMesh.name + "_reduced";
+
+                if (!assetEditingStarted)
+                {
+                    AssetDatabase.StartAssetEditing();
+                    assetEditingStarted = true;
+                }
+
+                bool createdAsset = MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "reduced", out _);
+                if (createdAsset)
+                {
+                    assetCreated = true;
+                    renderer.sharedMesh = newMesh;
+                }
+                else
+                {
+                    renderer.sharedMesh = newMesh;
+                }
+
+                EditorUtility.SetDirty(renderer);
+                if (renderer.sharedMesh != null)
+                    EditorUtility.SetDirty(renderer.sharedMesh);
+                PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
+                EditorSceneManager.MarkSceneDirty(renderer.gameObject.scene);
+                anyRendererModified = true;
+            }
         }
-
-        EditorUtility.ClearProgressBar();
+        finally
+        {
+            if (assetEditingStarted)
+                AssetDatabase.StopAssetEditing();
+            EditorUtility.ClearProgressBar();
+        }
 
         if (assetCreated)
         {
@@ -182,10 +199,12 @@ public static class MeshPolygonReducer
         float bestDeviation = float.MaxValue;
         int bestTriangleCount = -1;
 
+        var simplifier = new ArapMeshSimplifier(mesh, vertexMask);
+
         while (low <= high)
         {
             int target = (low + high) / 2;
-            if (TrySimplify(mesh, vertexMask, target, out var simplified))
+            if (TrySimplify(simplifier, target, out var simplified))
             {
                 int simplifiedTriangles = CountTotalTriangles(simplified);
                 if (simplifiedTriangles < lowerTriangleBound)
@@ -230,9 +249,8 @@ public static class MeshPolygonReducer
         return success ? bestMesh : null;
     }
 
-    private static bool TrySimplify(Mesh mesh, bool[] vertexMask, int targetCandidateCount, out Mesh simplified)
+    private static bool TrySimplify(ArapMeshSimplifier simplifier, int targetCandidateCount, out Mesh simplified)
     {
-        var simplifier = new ArapMeshSimplifier(mesh, vertexMask);
         var result = simplifier.Simplify(targetCandidateCount);
         if (result.HasValue)
         {
@@ -248,6 +266,21 @@ public static class MeshPolygonReducer
 
         simplified = null;
         return false;
+    }
+
+    private static bool[] GetOrCreateMask(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds, Dictionary<MaskCacheKey, bool[]> cache)
+    {
+        if (cache == null)
+            return MeshMulti.CalculateVerticesInsideBounds(renderer, mesh, bounds);
+
+        var key = new MaskCacheKey(renderer, mesh, bounds);
+        if (!cache.TryGetValue(key, out var mask))
+        {
+            mask = MeshMulti.CalculateVerticesInsideBounds(renderer, mesh, bounds);
+            cache[key] = mask;
+        }
+
+        return mask;
     }
 
     private static int CountTotalTriangles(Mesh mesh)
@@ -270,6 +303,47 @@ public static class MeshPolygonReducer
         }
 
         return total;
+    }
+}
+
+internal readonly struct MaskCacheKey : IEquatable<MaskCacheKey>
+{
+    private readonly int rendererId;
+    private readonly int meshId;
+    private readonly Vector3 center;
+    private readonly Vector3 extents;
+
+    public MaskCacheKey(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds)
+    {
+        rendererId = renderer != null ? renderer.GetInstanceID() : 0;
+        meshId = mesh != null ? mesh.GetInstanceID() : 0;
+        center = bounds.center;
+        extents = bounds.extents;
+    }
+
+    public bool Equals(MaskCacheKey other)
+    {
+        return rendererId == other.rendererId &&
+               meshId == other.meshId &&
+               center.Equals(other.center) &&
+               extents.Equals(other.extents);
+    }
+
+    public override bool Equals(object obj)
+    {
+        return obj is MaskCacheKey other && Equals(other);
+    }
+
+    public override int GetHashCode()
+    {
+        unchecked
+        {
+            int hash = rendererId;
+            hash = (hash * 397) ^ meshId;
+            hash = (hash * 397) ^ center.GetHashCode();
+            hash = (hash * 397) ^ extents.GetHashCode();
+            return hash;
+        }
     }
 }
 

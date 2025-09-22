@@ -1,5 +1,9 @@
 using System;
 using System.Collections.Generic;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Rendering;
 
@@ -35,6 +39,13 @@ internal sealed class ArapMeshSimplifier
     private PriorityQueue<EdgeCandidate> edgeQueue;
     private int activeVertexCount;
     private int candidateVertexCount;
+
+    private VertexData[] baseVertices;
+    private List<TriangleData> baseTriangles;
+    private List<int>[] baseSubmeshTriangleIndices;
+    private int baseCandidateVertexCount;
+    private int baseActiveVertexCount;
+    private bool baseInitialized;
 
     public struct Result
     {
@@ -75,6 +86,54 @@ internal sealed class ArapMeshSimplifier
         public Vector3 RestNormal;
     }
 
+    private struct TriangleInfo
+    {
+        public int A;
+        public int B;
+        public int C;
+        public bool Removed;
+    }
+
+    [BurstCompile]
+    private struct TriangleQuadricJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<TriangleInfo> Triangles;
+        [ReadOnly] public NativeArray<float3> RestPositions;
+        public float MinimumTriangleArea;
+        public NativeArray<SymmetricMatrix> Results;
+
+        public void Execute(int index)
+        {
+            var tri = Triangles[index];
+            if (tri.Removed)
+            {
+                Results[index] = SymmetricMatrix.Zero;
+                return;
+            }
+
+            float3 pa = RestPositions[tri.A];
+            float3 pb = RestPositions[tri.B];
+            float3 pc = RestPositions[tri.C];
+            float3 ab = pb - pa;
+            float3 ac = pc - pa;
+            float3 cross = math.cross(ab, ac);
+            float area = math.length(cross) * 0.5f;
+            if (area < MinimumTriangleArea)
+            {
+                Results[index] = SymmetricMatrix.Zero;
+                return;
+            }
+
+            float3 normal = math.normalize(cross);
+            double nx = normal.x;
+            double ny = normal.y;
+            double nz = normal.z;
+            double d = -(nx * pa.x + ny * pa.y + nz * pa.z);
+            var quadric = SymmetricMatrix.FromPlane(new double3(nx, ny, nz), d) * area;
+            Results[index] = quadric;
+        }
+    }
+
     private struct EdgeCandidate : IComparable<EdgeCandidate>
     {
         public int A;
@@ -100,6 +159,11 @@ internal sealed class ArapMeshSimplifier
         public static SymmetricMatrix Zero => new SymmetricMatrix();
 
         public static SymmetricMatrix FromPlane(Vector3 normal, float d)
+        {
+            return FromPlane(new double3(normal.x, normal.y, normal.z), d);
+        }
+
+        public static SymmetricMatrix FromPlane(double3 normal, double d)
         {
             double nx = normal.x;
             double ny = normal.y;
@@ -412,7 +476,8 @@ internal sealed class ArapMeshSimplifier
 
     public Result? Simplify(int targetCandidateCount)
     {
-        InitializeData();
+        EnsureBaseData();
+        ResetWorkingState();
         if (targetCandidateCount < 3)
             targetCandidateCount = 3;
         if (targetCandidateCount >= candidateVertexCount)
@@ -431,66 +496,30 @@ internal sealed class ArapMeshSimplifier
         return new Result { Mesh = mesh, RemovedTriangles = removedTriangles };
     }
 
-    private void InitializeData()
+    private void EnsureBaseData()
     {
+        if (baseInitialized)
+            return;
+
         int vertexCount = sourceVertices.Length;
-        vertices = new VertexData[vertexCount];
-        candidateVertexCount = 0;
-        activeVertexCount = vertexCount;
+        baseVertices = new VertexData[vertexCount];
+        baseCandidateVertexCount = 0;
+        baseActiveVertexCount = vertexCount;
 
         for (int i = 0; i < vertexCount; i++)
         {
             bool candidate = vertexMask == null || (vertexMask.Length == vertexCount && vertexMask[i]);
-            var data = new VertexData
-            {
-                Position = sourceVertices[i],
-                RestPosition = sourceVertices[i],
-                NormalSum = (sourceNormals != null && sourceNormals.Length == vertexCount) ? sourceNormals[i] : Vector3.zero,
-                TangentSum = (sourceTangents != null && sourceTangents.Length == vertexCount) ? sourceTangents[i] : Vector4.zero,
-                ColorSum = (sourceColors != null && sourceColors.Length == vertexCount) ? sourceColors[i] : Color.black,
-                UVSum = new Vector2[sourceUVs.Length],
-                UVSampleCount = new int[sourceUVs.Length],
-                BoneWeights = (sourceBoneWeights != null && sourceBoneWeights.Length == vertexCount) ? new Dictionary<int, float>(4) : null,
-                Locked = !candidate,
-                Candidate = candidate,
-                AggregateWeight = 1,
-                OriginalPositionSum = sourceVertices[i],
-                OriginalPositionSquaredSum = sourceVertices[i].sqrMagnitude,
-                Quadric = SymmetricMatrix.Zero,
-                Revision = 0
-            };
-
-            if (data.BoneWeights != null)
-            {
-                var bw = sourceBoneWeights[i];
-                AddBoneWeight(data.BoneWeights, bw.boneIndex0, bw.weight0);
-                AddBoneWeight(data.BoneWeights, bw.boneIndex1, bw.weight1);
-                AddBoneWeight(data.BoneWeights, bw.boneIndex2, bw.weight2);
-                AddBoneWeight(data.BoneWeights, bw.boneIndex3, bw.weight3);
-            }
-
-            for (int channel = 0; channel < sourceUVs.Length; channel++)
-            {
-                var uv = sourceUVs[channel];
-                if (uv != null && uv.Length == vertexCount)
-                {
-                    data.UVSum[channel] = uv[i];
-                    data.UVSampleCount[channel] = 1;
-                }
-            }
-
-            data.SourceIndices.Add(i);
-            vertices[i] = data;
+            baseVertices[i] = CreateInitialVertex(i, candidate);
             if (candidate)
-                candidateVertexCount++;
+                baseCandidateVertexCount++;
         }
 
-        triangles = new List<TriangleData>();
+        baseTriangles = new List<TriangleData>();
         int subMeshCount = Mathf.Max(1, sourceMesh.subMeshCount);
-        submeshTriangleIndices = new List<int>[subMeshCount];
+        baseSubmeshTriangleIndices = new List<int>[subMeshCount];
         for (int sub = 0; sub < subMeshCount; sub++)
         {
-            submeshTriangleIndices[sub] = new List<int>();
+            baseSubmeshTriangleIndices[sub] = new List<int>();
             int[] indices = (sourceMesh.subMeshCount == 0 && sub == 0) ? sourceMesh.triangles : sourceMesh.GetTriangles(sub);
             for (int i = 0; i < indices.Length; i += 3)
             {
@@ -514,44 +543,198 @@ internal sealed class ArapMeshSimplifier
                     Removed = false,
                     RestNormal = restNormal
                 };
-                int triIndex = triangles.Count;
-                triangles.Add(tri);
-                submeshTriangleIndices[sub].Add(triIndex);
+                int triIndex = baseTriangles.Count;
+                baseTriangles.Add(tri);
+                baseSubmeshTriangleIndices[sub].Add(triIndex);
 
-                vertices[a].Neighbors.Add(b);
-                vertices[a].Neighbors.Add(c);
-                vertices[b].Neighbors.Add(a);
-                vertices[b].Neighbors.Add(c);
-                vertices[c].Neighbors.Add(a);
-                vertices[c].Neighbors.Add(b);
+                baseVertices[a].Neighbors.Add(b);
+                baseVertices[a].Neighbors.Add(c);
+                baseVertices[b].Neighbors.Add(a);
+                baseVertices[b].Neighbors.Add(c);
+                baseVertices[c].Neighbors.Add(a);
+                baseVertices[c].Neighbors.Add(b);
 
-                vertices[a].IncidentTriangles.Add(triIndex);
-                vertices[b].IncidentTriangles.Add(triIndex);
-                vertices[c].IncidentTriangles.Add(triIndex);
+                baseVertices[a].IncidentTriangles.Add(triIndex);
+                baseVertices[b].IncidentTriangles.Add(triIndex);
+                baseVertices[c].IncidentTriangles.Add(triIndex);
             }
         }
+
+        baseInitialized = true;
+    }
+
+    private VertexData CreateInitialVertex(int index, bool candidate)
+    {
+        int vertexCount = sourceVertices.Length;
+        var data = new VertexData
+        {
+            Position = sourceVertices[index],
+            RestPosition = sourceVertices[index],
+            NormalSum = (sourceNormals != null && sourceNormals.Length == vertexCount) ? sourceNormals[index] : Vector3.zero,
+            TangentSum = (sourceTangents != null && sourceTangents.Length == vertexCount) ? sourceTangents[index] : Vector4.zero,
+            ColorSum = (sourceColors != null && sourceColors.Length == vertexCount) ? sourceColors[index] : Color.black,
+            UVSum = new Vector2[sourceUVs.Length],
+            UVSampleCount = new int[sourceUVs.Length],
+            BoneWeights = (sourceBoneWeights != null && sourceBoneWeights.Length == vertexCount) ? new Dictionary<int, float>(4) : null,
+            Locked = !candidate,
+            Candidate = candidate,
+            AggregateWeight = 1,
+            OriginalPositionSum = sourceVertices[index],
+            OriginalPositionSquaredSum = sourceVertices[index].sqrMagnitude,
+            Quadric = SymmetricMatrix.Zero,
+            Revision = 0
+        };
+
+        if (data.BoneWeights != null)
+        {
+            var bw = sourceBoneWeights[index];
+            AddBoneWeight(data.BoneWeights, bw.boneIndex0, bw.weight0);
+            AddBoneWeight(data.BoneWeights, bw.boneIndex1, bw.weight1);
+            AddBoneWeight(data.BoneWeights, bw.boneIndex2, bw.weight2);
+            AddBoneWeight(data.BoneWeights, bw.boneIndex3, bw.weight3);
+        }
+
+        for (int channel = 0; channel < sourceUVs.Length; channel++)
+        {
+            var uv = sourceUVs[channel];
+            if (uv != null && uv.Length == vertexCount)
+            {
+                data.UVSum[channel] = uv[index];
+                data.UVSampleCount[channel] = 1;
+            }
+        }
+
+        data.SourceIndices.Add(index);
+        return data;
+    }
+
+    private void ResetWorkingState()
+    {
+        if (!baseInitialized)
+            EnsureBaseData();
+
+        int vertexCount = baseVertices.Length;
+        vertices = new VertexData[vertexCount];
+        for (int i = 0; i < vertexCount; i++)
+        {
+            vertices[i] = CloneVertex(baseVertices[i]);
+        }
+
+        triangles = new List<TriangleData>(baseTriangles.Count);
+        for (int i = 0; i < baseTriangles.Count; i++)
+            triangles.Add(baseTriangles[i]);
+
+        submeshTriangleIndices = new List<int>[baseSubmeshTriangleIndices.Length];
+        for (int sub = 0; sub < baseSubmeshTriangleIndices.Length; sub++)
+            submeshTriangleIndices[sub] = new List<int>(baseSubmeshTriangleIndices[sub]);
+
+        candidateVertexCount = baseCandidateVertexCount;
+        activeVertexCount = baseActiveVertexCount;
+    }
+
+    private static VertexData CloneVertex(VertexData source)
+    {
+        if (source == null)
+            return null;
+
+        var clone = new VertexData
+        {
+            Position = source.Position,
+            RestPosition = source.RestPosition,
+            NormalSum = source.NormalSum,
+            TangentSum = source.TangentSum,
+            ColorSum = source.ColorSum,
+            UVSum = source.UVSum != null ? (Vector2[])source.UVSum.Clone() : null,
+            UVSampleCount = source.UVSampleCount != null ? (int[])source.UVSampleCount.Clone() : null,
+            BoneWeights = source.BoneWeights != null ? new Dictionary<int, float>(source.BoneWeights) : null,
+            Locked = source.Locked,
+            Candidate = source.Candidate,
+            AggregateWeight = source.AggregateWeight,
+            OriginalPositionSum = source.OriginalPositionSum,
+            OriginalPositionSquaredSum = source.OriginalPositionSquaredSum,
+            Quadric = SymmetricMatrix.Zero,
+            Revision = 0,
+            Removed = source.Removed
+        };
+
+        if (clone.UVSum == null)
+            clone.UVSum = Array.Empty<Vector2>();
+        if (clone.UVSampleCount == null)
+            clone.UVSampleCount = Array.Empty<int>();
+
+        clone.Neighbors = new HashSet<int>(source.Neighbors);
+        clone.IncidentTriangles = new HashSet<int>(source.IncidentTriangles);
+        clone.SourceIndices = new List<int>(source.SourceIndices);
+        return clone;
     }
 
     private void BuildTriangleQuadrics()
     {
-        for (int i = 0; i < triangles.Count; i++)
+        if (triangles == null || triangles.Count == 0)
+            return;
+
+        var triangleInfos = new NativeArray<TriangleInfo>(triangles.Count, Allocator.TempJob);
+        var restPositions = new NativeArray<float3>(vertices.Length, Allocator.TempJob);
+        var results = new NativeArray<SymmetricMatrix>(triangles.Count, Allocator.TempJob);
+
+        try
         {
-            if (triangles[i].Removed)
-                continue;
-            var tri = triangles[i];
-            Vector3 pa = vertices[tri.A].RestPosition;
-            Vector3 pb = vertices[tri.B].RestPosition;
-            Vector3 pc = vertices[tri.C].RestPosition;
-            Vector3 normal = Vector3.Cross(pb - pa, pc - pa);
-            float area = normal.magnitude * 0.5f;
-            if (area < MinimumTriangleArea)
-                continue;
-            normal.Normalize();
-            float d = -Vector3.Dot(normal, pa);
-            var q = SymmetricMatrix.FromPlane(normal, d) * area;
-            vertices[tri.A].Quadric = vertices[tri.A].Quadric + q;
-            vertices[tri.B].Quadric = vertices[tri.B].Quadric + q;
-            vertices[tri.C].Quadric = vertices[tri.C].Quadric + q;
+            for (int i = 0; i < triangles.Count; i++)
+            {
+                var tri = triangles[i];
+                triangleInfos[i] = new TriangleInfo
+                {
+                    A = tri.A,
+                    B = tri.B,
+                    C = tri.C,
+                    Removed = tri.Removed
+                };
+            }
+
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var vertex = vertices[i];
+                if (vertex != null)
+                {
+                    restPositions[i] = new float3(vertex.RestPosition.x, vertex.RestPosition.y, vertex.RestPosition.z);
+                    vertex.Quadric = SymmetricMatrix.Zero;
+                }
+                else
+                {
+                    restPositions[i] = float3.zero;
+                }
+            }
+
+            var job = new TriangleQuadricJob
+            {
+                Triangles = triangleInfos,
+                RestPositions = restPositions,
+                MinimumTriangleArea = MinimumTriangleArea,
+                Results = results
+            };
+
+            JobHandle handle = job.Schedule(triangleInfos.Length, 64);
+            handle.Complete();
+
+            for (int i = 0; i < triangles.Count; i++)
+            {
+                if (triangles[i].Removed)
+                    continue;
+                var tri = triangles[i];
+                var quadric = results[i];
+                vertices[tri.A].Quadric = vertices[tri.A].Quadric + quadric;
+                vertices[tri.B].Quadric = vertices[tri.B].Quadric + quadric;
+                vertices[tri.C].Quadric = vertices[tri.C].Quadric + quadric;
+            }
+        }
+        finally
+        {
+            if (triangleInfos.IsCreated)
+                triangleInfos.Dispose();
+            if (restPositions.IsCreated)
+                restPositions.Dispose();
+            if (results.IsCreated)
+                results.Dispose();
         }
     }
 

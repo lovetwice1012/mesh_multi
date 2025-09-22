@@ -1,5 +1,9 @@
 using System.Collections.Generic;
 using System.Linq;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -383,13 +387,76 @@ public static class MeshMulti
     {
         var vertices = mesh.vertices;
         var inside = new bool[vertices.Length];
-        Matrix4x4 localToWorld = renderer.transform.localToWorldMatrix;
-        for (int i = 0; i < vertices.Length; i++)
+        if (vertices.Length == 0)
+            return inside;
+
+        var nativeVertices = new NativeArray<float3>(vertices.Length, Allocator.TempJob);
+        var jobResult = new NativeArray<byte>(vertices.Length, Allocator.TempJob);
+
+        try
         {
-            Vector3 world = localToWorld.MultiplyPoint3x4(vertices[i]);
-            inside[i] = bounds.Contains(world);
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var v = vertices[i];
+                nativeVertices[i] = new float3(v.x, v.y, v.z);
+            }
+
+            Matrix4x4 unityMatrix = renderer.transform.localToWorldMatrix;
+            float4x4 localToWorld = ConvertToFloat4x4(unityMatrix);
+            Vector3 boundsMin = bounds.min;
+            Vector3 boundsMax = bounds.max;
+
+            var job = new BoundsContainmentJob
+            {
+                Vertices = nativeVertices,
+                LocalToWorld = localToWorld,
+                BoundsMin = new float3(boundsMin.x, boundsMin.y, boundsMin.z),
+                BoundsMax = new float3(boundsMax.x, boundsMax.y, boundsMax.z),
+                Result = jobResult
+            };
+
+            JobHandle handle = job.Schedule(vertices.Length, 64);
+            handle.Complete();
+
+            for (int i = 0; i < inside.Length; i++)
+                inside[i] = jobResult[i] != 0;
         }
+        finally
+        {
+            if (jobResult.IsCreated)
+                jobResult.Dispose();
+            if (nativeVertices.IsCreated)
+                nativeVertices.Dispose();
+        }
+
         return inside;
+    }
+
+    [BurstCompile]
+    private struct BoundsContainmentJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<float3> Vertices;
+        public float4x4 LocalToWorld;
+        public float3 BoundsMin;
+        public float3 BoundsMax;
+        public NativeArray<byte> Result;
+
+        public void Execute(int index)
+        {
+            float4 world4 = math.mul(LocalToWorld, new float4(Vertices[index], 1f));
+            float3 world = world4.xyz;
+            bool inside = math.all(world >= BoundsMin & world <= BoundsMax);
+            Result[index] = inside ? (byte)1 : (byte)0;
+        }
+    }
+
+    private static float4x4 ConvertToFloat4x4(Matrix4x4 matrix)
+    {
+        return new float4x4(
+            new float4(matrix.m00, matrix.m01, matrix.m02, matrix.m03),
+            new float4(matrix.m10, matrix.m11, matrix.m12, matrix.m13),
+            new float4(matrix.m20, matrix.m21, matrix.m22, matrix.m23),
+            new float4(matrix.m30, matrix.m31, matrix.m32, matrix.m33));
     }
 
     private struct TriangleData
