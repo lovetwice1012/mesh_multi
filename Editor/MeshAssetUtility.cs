@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Text;
 using UnityEditor;
@@ -21,22 +22,95 @@ public static class MeshAssetUtility
             directory = "Assets";
 
         string fileName = BuildFileName(originalMesh, originalPath, suffix);
-        string candidatePath = CombineAssetPath(directory, fileName);
-        candidatePath = AssetDatabase.GenerateUniqueAssetPath(candidatePath);
+        var candidateDirectories = BuildCandidateDirectories(directory);
 
-        try
+        foreach (string candidateDirectory in candidateDirectories)
         {
-            AssetDatabase.CreateAsset(mesh, candidatePath);
+            if (!EnsureFolderExists(candidateDirectory))
+                continue;
+
+            string candidatePath = CombineAssetPath(candidateDirectory, fileName);
+            candidatePath = AssetDatabase.GenerateUniqueAssetPath(candidatePath);
+
+            try
+            {
+                AssetDatabase.CreateAsset(mesh, candidatePath);
+                Undo.RegisterCreatedObjectUndo(mesh, "Create Derived Mesh Asset");
+                assetPath = candidatePath;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"Failed to create derived mesh asset at '{candidatePath}': {ex.Message}");
+            }
         }
-        catch (Exception ex)
+
+        Debug.LogError("Failed to create a writable location for the reduced mesh asset. Please choose a folder under the Assets directory.");
+        return false;
+    }
+
+    private static List<string> BuildCandidateDirectories(string initialDirectory)
+    {
+        const string FallbackDirectory = "Assets/ReducedMeshes";
+
+        var directories = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        void AddDirectory(string path)
         {
-            Debug.LogError($"Failed to create derived mesh asset at '{candidatePath}': {ex.Message}");
+            if (string.IsNullOrEmpty(path))
+                return;
+            if (!seen.Add(path))
+                return;
+            directories.Add(path);
+        }
+
+        if (IsAssetsRelativeDirectory(initialDirectory))
+            AddDirectory(initialDirectory);
+
+        AddDirectory(FallbackDirectory);
+        AddDirectory("Assets");
+
+        return directories;
+    }
+
+    private static bool EnsureFolderExists(string assetsDirectory)
+    {
+        if (string.IsNullOrEmpty(assetsDirectory))
             return false;
+
+        if (!IsAssetsRelativeDirectory(assetsDirectory))
+            return false;
+
+        if (AssetDatabase.IsValidFolder(assetsDirectory))
+            return true;
+
+        string[] segments = assetsDirectory.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0 || !segments[0].Equals("Assets", StringComparison.Ordinal))
+            return false;
+
+        string currentPath = segments[0];
+        for (int i = 1; i < segments.Length; i++)
+        {
+            string segment = segments[i];
+            string parent = currentPath;
+            currentPath = CombineAssetPath(currentPath, segment);
+            if (AssetDatabase.IsValidFolder(currentPath))
+                continue;
+
+            AssetDatabase.CreateFolder(parent, segment);
         }
 
-        Undo.RegisterCreatedObjectUndo(mesh, "Create Derived Mesh Asset");
-        assetPath = candidatePath;
-        return true;
+        return AssetDatabase.IsValidFolder(assetsDirectory);
+    }
+
+    private static bool IsAssetsRelativeDirectory(string directory)
+    {
+        if (string.IsNullOrEmpty(directory))
+            return false;
+
+        return directory.Equals("Assets", StringComparison.Ordinal) ||
+               directory.StartsWith("Assets/", StringComparison.Ordinal);
     }
 
     private static string CombineAssetPath(string directory, string fileName)
