@@ -2274,14 +2274,29 @@ internal sealed class ArapMeshSimplifier
         }
 
         mesh.RecalculateBounds();
-        Bounds combinedBounds = mesh.bounds;
+        Bounds recalculatedBounds = mesh.bounds;
         Bounds sourceBounds = sourceMesh.bounds;
         if (sourceBounds.size.sqrMagnitude > 0f)
         {
-            combinedBounds.Encapsulate(sourceBounds.min);
-            combinedBounds.Encapsulate(sourceBounds.max);
+            Vector3 center = sourceBounds.center;
+            Vector3 extents = sourceBounds.extents;
+
+            float extentX = Mathf.Max(extents.x,
+                Mathf.Abs(center.x - recalculatedBounds.min.x),
+                Mathf.Abs(recalculatedBounds.max.x - center.x));
+            float extentY = Mathf.Max(extents.y,
+                Mathf.Abs(center.y - recalculatedBounds.min.y),
+                Mathf.Abs(recalculatedBounds.max.y - center.y));
+            float extentZ = Mathf.Max(extents.z,
+                Mathf.Abs(center.z - recalculatedBounds.min.z),
+                Mathf.Abs(recalculatedBounds.max.z - center.z));
+
+            mesh.bounds = new Bounds(center, new Vector3(extentX * 2f, extentY * 2f, extentZ * 2f));
         }
-        mesh.bounds = combinedBounds;
+        else
+        {
+            mesh.bounds = recalculatedBounds;
+        }
         if (mesh.normals == null || mesh.normals.Length == 0)
             mesh.RecalculateNormals();
         if (mesh.tangents == null || mesh.tangents.Length == 0)
