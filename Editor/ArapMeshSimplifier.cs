@@ -2181,27 +2181,42 @@ internal sealed class ArapMeshSimplifier
                     case MeshTopology.Points:
                     {
                         var points = new List<int>();
+                        bool removedPoint = false;
                         for (int i = 0; i < originalIndices.Length; i++)
                         {
                             int mapped = MapIndex(map, originalIndices[i]);
                             if (mapped >= 0)
+                            {
                                 points.Add(mapped);
+                            }
+                            else
+                            {
+                                removedPoint = true;
+                            }
                         }
+                        if (removedPoint)
+                            removedAnyTriangle = true;
                         mesh.SetIndices(points.ToArray(), MeshTopology.Points, sub, true);
                         continue;
                     }
                     case MeshTopology.Lines:
                     {
                         var lines = new List<int>();
+                        bool removedLine = false;
                         for (int i = 0; i + 1 < originalIndices.Length; i += 2)
                         {
                             int a = MapIndex(map, originalIndices[i]);
                             int b = MapIndex(map, originalIndices[i + 1]);
                             if (a < 0 || b < 0)
+                            {
+                                removedLine = true;
                                 continue;
+                            }
                             lines.Add(a);
                             lines.Add(b);
                         }
+                        if (removedLine)
+                            removedAnyTriangle = true;
                         mesh.SetIndices(lines.ToArray(), MeshTopology.Lines, sub, true);
                         continue;
                     }
@@ -2210,12 +2225,14 @@ internal sealed class ArapMeshSimplifier
                         var segments = new List<int>();
                         int previous = -1;
                         bool previousValid = false;
+                        bool removedSegment = false;
                         for (int i = 0; i < originalIndices.Length; i++)
                         {
                             int mapped = MapIndex(map, originalIndices[i]);
                             if (mapped < 0)
                             {
                                 previousValid = false;
+                                removedSegment = true;
                                 continue;
                             }
 
@@ -2229,6 +2246,8 @@ internal sealed class ArapMeshSimplifier
                             previousValid = true;
                         }
 
+                        if (removedSegment)
+                            removedAnyTriangle = true;
                         mesh.SetIndices(segments.ToArray(), MeshTopology.Lines, sub, true);
                         continue;
                     }
@@ -2702,6 +2721,11 @@ internal sealed class ArapMeshSimplifier
         var indices = new List<int>();
         foreach (var (oa, ob, oc) in EnumerateSubmeshTriangles(topology, originalIndices))
         {
+            if (oa == ob || ob == oc || oc == oa)
+            {
+                removedAnyTriangle = true;
+                continue;
+            }
             int a = MapIndex(map, oa);
             int b = MapIndex(map, ob);
             int c = MapIndex(map, oc);
@@ -2711,6 +2735,11 @@ internal sealed class ArapMeshSimplifier
                 continue;
             }
 
+            if (a == b || b == c || c == a)
+            {
+                removedAnyTriangle = true;
+                continue;
+            }
             indices.Add(a);
             indices.Add(b);
             indices.Add(c);

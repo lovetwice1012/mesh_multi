@@ -253,11 +253,11 @@ public static class MeshPolygonReducer
             return null;
         }
 
-        float targetTriangleFloat = Mathf.Max(1f, originalTriangles * (1f - reductionRatio));
-        int targetTriangles = Mathf.Max(1, Mathf.RoundToInt(targetTriangleFloat));
-        int lowerTriangleBound = Mathf.Max(1, Mathf.RoundToInt(targetTriangleFloat * 0.95f));
+        float targetTriangleFloat = Mathf.Max(0f, originalTriangles * (1f - reductionRatio));
+        int targetTriangles = Mathf.Clamp(Mathf.RoundToInt(targetTriangleFloat), 0, originalTriangles);
+        int lowerTriangleBound = Mathf.Clamp(Mathf.RoundToInt(targetTriangleFloat * 0.95f), 0, originalTriangles);
         int upperTriangleBound = Mathf.Max(lowerTriangleBound, Mathf.RoundToInt(targetTriangleFloat * 1.05f));
-        upperTriangleBound = Mathf.Min(upperTriangleBound, originalTriangles);
+        upperTriangleBound = Mathf.Clamp(upperTriangleBound, lowerTriangleBound, originalTriangles);
 
         var simplifier = new ArapMeshSimplifier(mesh, effectiveMask, seed);
         int actualCandidateVertices = simplifier.GetCandidateVertexCount();
