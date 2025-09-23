@@ -758,43 +758,52 @@ internal sealed class ArapMeshSimplifier
                 ? sourceSubmeshIndices[sub]
                 : Array.Empty<int>();
             foreach (var (a, b, c) in EnumerateSubmeshTriangles(topology, indices))
-            {
-                if (a == b || b == c || c == a)
-                    continue;
-
-                Vector3 cross = Vector3.Cross(sourceVertices[b] - sourceVertices[a], sourceVertices[c] - sourceVertices[a]);
-                float crossMagnitudeSquared = cross.sqrMagnitude;
-                if (crossMagnitudeSquared < MinimumTriangleCrossMagnitudeSquared)
-                    continue;
-
-                Vector3 restNormal = cross / Mathf.Sqrt(crossMagnitudeSquared);
-                var tri = new TriangleData
-                {
-                    Submesh = sub,
-                    A = a,
-                    B = b,
-                    C = c,
-                    Removed = false,
-                    RestNormal = restNormal
-                };
-                int triIndex = baseTriangles.Count;
-                baseTriangles.Add(tri);
-                baseSubmeshTriangleIndices[sub].Add(triIndex);
-
-                baseVertices[a].Neighbors.Add(b);
-                baseVertices[a].Neighbors.Add(c);
-                baseVertices[b].Neighbors.Add(a);
-                baseVertices[b].Neighbors.Add(c);
-                baseVertices[c].Neighbors.Add(a);
-                baseVertices[c].Neighbors.Add(b);
-
-                baseVertices[a].IncidentTriangles.Add(triIndex);
-                baseVertices[b].IncidentTriangles.Add(triIndex);
-                baseVertices[c].IncidentTriangles.Add(triIndex);
-            }
+                TryAddBaseTriangle(sub, a, b, c);
         }
 
         baseInitialized = true;
+    }
+
+    private bool TryAddBaseTriangle(int submesh, int a, int b, int c)
+    {
+        if (a == b || b == c || c == a)
+            return false;
+
+        Vector3 pa = sourceVertices[a];
+        Vector3 pb = sourceVertices[b];
+        Vector3 pc = sourceVertices[c];
+
+        Vector3 cross = Vector3.Cross(pb - pa, pc - pa);
+        float crossMagnitudeSquared = cross.sqrMagnitude;
+        if (crossMagnitudeSquared < MinimumTriangleCrossMagnitudeSquared)
+            return false;
+
+        Vector3 restNormal = cross / Mathf.Sqrt(crossMagnitudeSquared);
+        var tri = new TriangleData
+        {
+            Submesh = submesh,
+            A = a,
+            B = b,
+            C = c,
+            Removed = false,
+            RestNormal = restNormal
+        };
+
+        int triIndex = baseTriangles.Count;
+        baseTriangles.Add(tri);
+        baseSubmeshTriangleIndices[submesh].Add(triIndex);
+
+        RegisterTriangleVertex(baseVertices[a], triIndex, b, c);
+        RegisterTriangleVertex(baseVertices[b], triIndex, a, c);
+        RegisterTriangleVertex(baseVertices[c], triIndex, a, b);
+        return true;
+    }
+
+    private static void RegisterTriangleVertex(VertexData vertex, int triangleIndex, int neighbor0, int neighbor1)
+    {
+        vertex.Neighbors.Add(neighbor0);
+        vertex.Neighbors.Add(neighbor1);
+        vertex.IncidentTriangles.Add(triangleIndex);
     }
 
     private VertexData CreateInitialVertex(int index, bool candidate)
