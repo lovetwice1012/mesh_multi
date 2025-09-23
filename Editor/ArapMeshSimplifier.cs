@@ -716,6 +716,12 @@ internal sealed class ArapMeshSimplifier
         return new Result { Mesh = mesh, RemovedTriangles = removedTriangles };
     }
 
+    public int GetCandidateVertexCount()
+    {
+        EnsureBaseData();
+        return baseCandidateVertexCount;
+    }
+
     private void EnsureBaseData()
     {
         if (baseInitialized)

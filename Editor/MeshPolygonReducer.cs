@@ -96,8 +96,10 @@ public static class MeshPolygonReducer
 
                 bool[] vertexMask = null;
                 if (limitBounds.HasValue)
+                {
                     bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
                     vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache, evaluateInCurrentPose);
+                }
 
                 Undo.RegisterCompleteObjectUndo(renderer, "Reduce Skinned Mesh Polygons");
 
@@ -224,6 +226,16 @@ public static class MeshPolygonReducer
         int lowerTriangleBound = Mathf.Max(1, Mathf.RoundToInt(targetTriangleFloat * 0.95f));
         int upperTriangleBound = Mathf.Max(lowerTriangleBound, Mathf.RoundToInt(targetTriangleFloat * 1.05f));
         upperTriangleBound = Mathf.Min(upperTriangleBound, originalTriangles);
+
+        var simplifier = new ArapMeshSimplifier(mesh, effectiveMask, seed);
+        int actualCandidateVertices = simplifier.GetCandidateVertexCount();
+        if (actualCandidateVertices < 3)
+        {
+            Debug.LogWarning($"Only {actualCandidateVertices} vertices are available for reduction on mesh '{mesh.name}'. The reduction bounds or topology constraints leave too few vertices to simplify.");
+            return null;
+        }
+
+        candidateVertices = Mathf.Min(candidateVertices, actualCandidateVertices);
         int desiredCandidateVertices = Mathf.Max(3, candidateVertices - Mathf.RoundToInt(candidateVertices * reductionRatio));
         if (desiredCandidateVertices >= candidateVertices)
         {
@@ -237,7 +249,7 @@ public static class MeshPolygonReducer
             return null;
         }
 
-        int maxCandidateVertices = candidateVertices - 1;
+        int maxCandidateVertices = Mathf.Min(candidateVertices - 1, actualCandidateVertices - 1);
         int minTarget = Mathf.Clamp(desiredCandidateVertices, 3, maxCandidateVertices);
         int low = minTarget;
         int high = maxCandidateVertices;
@@ -245,8 +257,37 @@ public static class MeshPolygonReducer
         bool success = false;
         float bestDeviation = float.MaxValue;
         int bestTriangleCount = -1;
+        Mesh fallbackMesh = null;
+        float fallbackDeviation = float.MaxValue;
+        int fallbackTriangleCount = int.MaxValue;
 
-        var simplifier = new ArapMeshSimplifier(mesh, effectiveMask, seed);
+        bool TryStoreFallback(Mesh candidateMesh, int triangleCount)
+        {
+            if (candidateMesh == null)
+                return false;
+
+            if (triangleCount >= originalTriangles)
+            {
+                UnityEngine.Object.DestroyImmediate(candidateMesh);
+                return false;
+            }
+
+            float deviation = Mathf.Abs(triangleCount - targetTriangles);
+            bool replace = fallbackMesh == null || deviation < fallbackDeviation ||
+                           (Mathf.Approximately(deviation, fallbackDeviation) && triangleCount < fallbackTriangleCount);
+            if (replace)
+            {
+                if (fallbackMesh != null)
+                    UnityEngine.Object.DestroyImmediate(fallbackMesh);
+                fallbackMesh = candidateMesh;
+                fallbackDeviation = deviation;
+                fallbackTriangleCount = triangleCount;
+                return true;
+            }
+
+            UnityEngine.Object.DestroyImmediate(candidateMesh);
+            return false;
+        }
 
         while (low <= high)
         {
@@ -256,14 +297,14 @@ public static class MeshPolygonReducer
                 int simplifiedTriangles = CountTotalTriangles(simplified);
                 if (simplifiedTriangles < lowerTriangleBound)
                 {
-                    UnityEngine.Object.DestroyImmediate(simplified);
+                    TryStoreFallback(simplified, simplifiedTriangles);
                     low = target + 1;
                     continue;
                 }
 
                 if (simplifiedTriangles > upperTriangleBound)
                 {
-                    UnityEngine.Object.DestroyImmediate(simplified);
+                    TryStoreFallback(simplified, simplifiedTriangles);
                     high = target - 1;
                     continue;
                 }
@@ -281,7 +322,7 @@ public static class MeshPolygonReducer
                 }
                 else
                 {
-                    UnityEngine.Object.DestroyImmediate(simplified);
+                    TryStoreFallback(simplified, simplifiedTriangles);
                 }
 
                 success = true;
@@ -293,7 +334,14 @@ public static class MeshPolygonReducer
             }
         }
 
-        return success ? bestMesh : null;
+        if (success)
+        {
+            if (fallbackMesh != null)
+                UnityEngine.Object.DestroyImmediate(fallbackMesh);
+            return bestMesh;
+        }
+
+        return fallbackMesh;
     }
 
     private static bool TrySimplify(ArapMeshSimplifier simplifier, int targetCandidateCount, out Mesh simplified)
