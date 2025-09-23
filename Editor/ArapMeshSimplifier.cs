@@ -22,7 +22,7 @@ internal sealed class ArapMeshSimplifier
     private const float ConjugateGradientTolerance = 1e-8f;
     private const float BoneWeightCompatibilityThreshold = 0.01f;
     // 改良: 元座標との差を強く抑制するためのペナルティ係数
-    private const float OriginalPositionPenaltyWeight = 250f;
+    private const float OriginalPositionPenaltyBase = 250f;
     private const float AxisConstraintEpsilon = 1e-6f;
     private const float DefaultRadialWeight = 2.0f;
     private const float DefaultTangentialWeight = 1.0f;
@@ -41,6 +41,7 @@ internal sealed class ArapMeshSimplifier
     private readonly MeshTopology[] sourceSubmeshTopologies;
     private readonly int[][] sourceSubmeshIndices;
     private readonly bool[] topologyLockedVertices;
+    private readonly float originalPositionPenaltyWeight;
 
     private VertexData[] vertices;
     private List<TriangleData> triangles;
@@ -531,6 +532,11 @@ internal sealed class ArapMeshSimplifier
             sourceUVs = ReadUVChannels(meshData);
             (sourceSubmeshTopologies, sourceSubmeshIndices, topologyLockedVertices) = ReadSubmeshData(mesh, meshData);
         }
+
+        var bounds = mesh.bounds;
+        float diagonal = bounds.size.magnitude;
+        float normalization = Mathf.Max(diagonal, 1f);
+        originalPositionPenaltyWeight = OriginalPositionPenaltyBase / (normalization * normalization);
     }
 
     public void SetAxisConstraints(AxisConstraint[] constraints)
@@ -1502,7 +1508,7 @@ internal sealed class ArapMeshSimplifier
         if (combinedWeight > 0)
             penalty = sumSquaredDistance / combinedWeight;
 
-        return (float)quadricCost + OriginalPositionPenaltyWeight * penalty;
+        return (float)quadricCost + originalPositionPenaltyWeight * penalty;
     }
 
     private Dictionary<int, float>[] BuildCotangentWeights()
@@ -1749,7 +1755,7 @@ internal sealed class ArapMeshSimplifier
 
         if (!hasLockedVertices && n > 0)
         {
-            const float anchorWeight = OriginalPositionPenaltyWeight;
+            float anchorWeight = originalPositionPenaltyWeight;
             var anchors = SelectAnchorVertices(freeVertices);
             foreach (int anchorVertex in anchors)
             {
@@ -2128,28 +2134,112 @@ internal sealed class ArapMeshSimplifier
                     continue;
                 }
 
-                int[] remapped = new int[originalIndices.Length];
-                int validCount = 0;
+                bool containsInvalid = false;
                 for (int i = 0; i < originalIndices.Length; i++)
                 {
                     int originalIndex = originalIndices[i];
                     int mapped = (originalIndex >= 0 && originalIndex < map.Length) ? map[originalIndex] : -1;
                     if (mapped < 0)
-                        continue;
-                    remapped[validCount++] = mapped;
+                    {
+                        containsInvalid = true;
+                        break;
+                    }
                 }
 
-                if (validCount == 0)
+                if (!containsInvalid)
                 {
-                    mesh.SetIndices(Array.Empty<int>(), topology, sub, true);
-                }
-                else
-                {
-                    if (validCount != remapped.Length)
-                        Array.Resize(ref remapped, validCount);
+                    var remapped = new int[originalIndices.Length];
+                    for (int i = 0; i < originalIndices.Length; i++)
+                        remapped[i] = map[originalIndices[i]];
                     mesh.SetIndices(remapped, topology, sub, true);
+                    continue;
                 }
-                continue;
+
+                switch (topology)
+                {
+                    case MeshTopology.Points:
+                    {
+                        var points = new List<int>();
+                        for (int i = 0; i < originalIndices.Length; i++)
+                        {
+                            int mapped = MapIndex(map, originalIndices[i]);
+                            if (mapped >= 0)
+                                points.Add(mapped);
+                        }
+                        mesh.SetIndices(points.ToArray(), MeshTopology.Points, sub, true);
+                        continue;
+                    }
+                    case MeshTopology.Lines:
+                    {
+                        var lines = new List<int>();
+                        for (int i = 0; i + 1 < originalIndices.Length; i += 2)
+                        {
+                            int a = MapIndex(map, originalIndices[i]);
+                            int b = MapIndex(map, originalIndices[i + 1]);
+                            if (a < 0 || b < 0)
+                                continue;
+                            lines.Add(a);
+                            lines.Add(b);
+                        }
+                        mesh.SetIndices(lines.ToArray(), MeshTopology.Lines, sub, true);
+                        continue;
+                    }
+                    case MeshTopology.LineStrip:
+                    {
+                        var segments = new List<int>();
+                        int previous = -1;
+                        bool previousValid = false;
+                        for (int i = 0; i < originalIndices.Length; i++)
+                        {
+                            int mapped = MapIndex(map, originalIndices[i]);
+                            if (mapped < 0)
+                            {
+                                previousValid = false;
+                                continue;
+                            }
+
+                            if (previousValid)
+                            {
+                                segments.Add(previous);
+                                segments.Add(mapped);
+                            }
+
+                            previous = mapped;
+                            previousValid = true;
+                        }
+
+                        mesh.SetIndices(segments.ToArray(), MeshTopology.Lines, sub, true);
+                        continue;
+                    }
+                    case MeshTopology.Quads:
+                    case MeshTopology.TriangleStrip:
+                    case MeshTopology.TriangleFan:
+                    {
+                        var indices = new List<int>();
+                        foreach (var (oa, ob, oc) in EnumerateSubmeshTriangles(topology, originalIndices))
+                        {
+                            int a = MapIndex(map, oa);
+                            int b = MapIndex(map, ob);
+                            int c = MapIndex(map, oc);
+                            if (a < 0 || b < 0 || c < 0)
+                            {
+                                removedAnyTriangle = true;
+                                continue;
+                            }
+
+                            indices.Add(a);
+                            indices.Add(b);
+                            indices.Add(c);
+                            anyTriangles = true;
+                        }
+
+                        mesh.SetIndices(indices.ToArray(), MeshTopology.Triangles, sub, true);
+                        continue;
+                    }
+                    default:
+                        mesh.SetIndices(Array.Empty<int>(), topology, sub, true);
+                        continue;
+                }
             }
 
             var list = submeshTriangleIndices[sub];
@@ -2320,6 +2410,14 @@ internal sealed class ArapMeshSimplifier
             }
         }
         return bw;
+    }
+
+    private static int MapIndex(int[] map, int originalIndex)
+    {
+        if (map == null || originalIndex < 0 || originalIndex >= map.Length)
+            return -1;
+
+        return map[originalIndex];
     }
 
     private static Vector3[] ReadVertices(Mesh.MeshData meshData)
@@ -2602,6 +2700,27 @@ internal sealed class ArapMeshSimplifier
                     int d = indices[i + 3];
                     yield return (a, b, c);
                     yield return (a, c, d);
+                }
+                break;
+            case MeshTopology.TriangleStrip:
+                for (int i = 0; i + 2 < indices.Length; i++)
+                {
+                    int a = indices[i];
+                    int b = indices[i + 1];
+                    int c = indices[i + 2];
+                    if ((i & 1) == 1)
+                        yield return (a, c, b);
+                    else
+                        yield return (a, b, c);
+                }
+                break;
+            case MeshTopology.TriangleFan:
+                for (int i = 1; i + 1 < indices.Length; i++)
+                {
+                    int a = indices[0];
+                    int b = indices[i];
+                    int c = indices[i + 1];
+                    yield return (a, b, c);
                 }
                 break;
         }

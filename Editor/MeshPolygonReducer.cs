@@ -328,7 +328,7 @@ public static class MeshPolygonReducer
         return mask;
     }
 
-    internal static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds)
+    internal static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds, bool evaluateInCurrentPose = false)
     {
         if (mesh == null)
             return Array.Empty<bool>();
@@ -341,12 +341,17 @@ public static class MeshPolygonReducer
             return inside;
 
         var worldPositions = new Vector3[vertices.Length];
-        bool usedSkinning = TryComputeSkinnedWorldPositions(renderer, mesh, vertices, worldPositions);
+        string failureMessage = null;
+        bool usedSkinning = evaluateInCurrentPose && TryComputeSkinnedWorldPositions(renderer, mesh, vertices, worldPositions, out failureMessage);
         if (!usedSkinning)
         {
-            Matrix4x4 localToWorld = renderer != null ? renderer.transform.localToWorldMatrix : Matrix4x4.identity;
-            for (int i = 0; i < vertices.Length; i++)
-                worldPositions[i] = localToWorld.MultiplyPoint3x4(vertices[i]);
+            if (evaluateInCurrentPose && !string.IsNullOrEmpty(failureMessage))
+            {
+                string rendererName = renderer != null ? renderer.name : mesh.name;
+                Debug.LogWarning($"Failed to evaluate animated vertex positions for '{rendererName}': {failureMessage}. Falling back to the mesh rest pose.");
+            }
+
+            FillWorldPositionsFromTransform(renderer, vertices, worldPositions);
         }
 
         Vector3 boundsMin = bounds.min;
@@ -362,28 +367,54 @@ public static class MeshPolygonReducer
         return inside;
     }
 
-    private static bool TryComputeSkinnedWorldPositions(SkinnedMeshRenderer renderer, Mesh mesh, Vector3[] vertices, Vector3[] worldPositions)
+    private static void FillWorldPositionsFromTransform(SkinnedMeshRenderer renderer, Vector3[] vertices, Vector3[] worldPositions)
     {
+        Matrix4x4 localToWorld = renderer != null ? renderer.transform.localToWorldMatrix : Matrix4x4.identity;
+        for (int i = 0; i < vertices.Length; i++)
+            worldPositions[i] = localToWorld.MultiplyPoint3x4(vertices[i]);
+    }
+
+    private static bool TryComputeSkinnedWorldPositions(SkinnedMeshRenderer renderer, Mesh mesh, Vector3[] vertices, Vector3[] worldPositions, out string errorMessage)
+    {
+        errorMessage = null;
         if (renderer == null)
+        {
+            errorMessage = "Renderer is null.";
             return false;
+        }
 
         if (!TryGetBoneWeights(mesh, out var boneWeights) || boneWeights == null)
+        {
+            errorMessage = "The mesh does not expose CPU bone weights.";
             return false;
+        }
         var bindPoses = mesh.bindposes;
         var bones = renderer.bones;
 
         if (boneWeights == null || boneWeights.Length != vertices.Length)
+        {
+            errorMessage = "Bone weight count does not match vertex count.";
             return false;
+        }
 
         if (bindPoses == null || bindPoses.Length == 0)
+        {
+            errorMessage = "Mesh is missing bind poses.";
             return false;
+        }
 
         if (bones == null || bones.Length == 0)
+        {
+            errorMessage = "Renderer does not reference any bones.";
             return false;
+        }
 
         int matrixCount = Math.Min(bindPoses.Length, bones.Length);
         if (matrixCount == 0)
+        {
+            errorMessage = "No matching bones were found between the renderer and mesh bind poses.";
             return false;
+        }
 
         var boneMatrices = new Matrix4x4[matrixCount];
         Matrix4x4 fallbackMatrix = renderer.transform.localToWorldMatrix;
@@ -395,6 +426,7 @@ public static class MeshPolygonReducer
         }
 
         bool anySkinningApplied = false;
+        bool encounteredInvalidInfluence = false;
         for (int i = 0; i < vertices.Length; i++)
         {
             BoneWeight weight = boneWeights[i];
@@ -402,10 +434,16 @@ public static class MeshPolygonReducer
             float totalWeight = 0f;
             Vector3 skinned = Vector3.zero;
 
-            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight0, weight.boneIndex0, boneMatrices, matrixCount, local);
-            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight1, weight.boneIndex1, boneMatrices, matrixCount, local);
-            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight2, weight.boneIndex2, boneMatrices, matrixCount, local);
-            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight3, weight.boneIndex3, boneMatrices, matrixCount, local);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight0, weight.boneIndex0, boneMatrices, matrixCount, local, ref encounteredInvalidInfluence);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight1, weight.boneIndex1, boneMatrices, matrixCount, local, ref encounteredInvalidInfluence);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight2, weight.boneIndex2, boneMatrices, matrixCount, local, ref encounteredInvalidInfluence);
+            ApplyBoneWeight(ref skinned, ref totalWeight, weight.weight3, weight.boneIndex3, boneMatrices, matrixCount, local, ref encounteredInvalidInfluence);
+
+            if (encounteredInvalidInfluence)
+            {
+                errorMessage = "Bone weights reference indices outside the available bone or bind-pose range.";
+                return false;
+            }
 
             if (totalWeight > 0f)
             {
@@ -421,16 +459,25 @@ public static class MeshPolygonReducer
             }
         }
 
+        if (!anySkinningApplied)
+        {
+            errorMessage = "No vertices contained valid skinning information.";
+            return false;
+        }
+
         return anySkinningApplied;
     }
 
-    private static void ApplyBoneWeight(ref Vector3 accum, ref float totalWeight, float weight, int boneIndex, Matrix4x4[] boneMatrices, int matrixCount, Vector3 localPosition)
+    private static void ApplyBoneWeight(ref Vector3 accum, ref float totalWeight, float weight, int boneIndex, Matrix4x4[] boneMatrices, int matrixCount, Vector3 localPosition, ref bool invalidIndexEncountered)
     {
         if (weight <= 0f)
             return;
 
         if (boneIndex < 0 || boneIndex >= matrixCount)
+        {
+            invalidIndexEncountered = true;
             return;
+        }
 
         accum += boneMatrices[boneIndex].MultiplyPoint3x4(localPosition) * weight;
         totalWeight += weight;
