@@ -737,7 +737,7 @@ public class MeshPolygonReducerWindow : EditorWindow
             bool[] mask = null;
             if (restrictToBounds && boundsValid)
             {
-                mask = CalculateVerticesInsideBounds(renderer, mesh, activeBounds);
+                mask = MeshPolygonReducer.CalculateVerticesInsideBounds(renderer, mesh, activeBounds);
                 for (int v = 0; v < mask.Length; v++)
                 {
                     if (mask[v])
