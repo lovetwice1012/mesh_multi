@@ -23,31 +23,45 @@ public static class MeshAssetUtility
         }
 
         string fileName = BuildFileName(originalMesh, originalPath, suffix);
-        var candidateDirectories = BuildCandidateDirectories(directory);
 
-        foreach (string candidateDirectory in candidateDirectories)
+        foreach (string candidatePath in EnumerateCandidatePaths(directory, fileName))
         {
-            if (!EnsureFolderExists(candidateDirectory))
-                continue;
-
-            string candidatePath = CombineAssetPath(candidateDirectory, fileName);
-            candidatePath = AssetDatabase.GenerateUniqueAssetPath(candidatePath);
-
-            try
+            string uniquePath = AssetDatabase.GenerateUniqueAssetPath(candidatePath);
+            if (TryCreateAsset(mesh, uniquePath))
             {
-                AssetDatabase.CreateAsset(mesh, candidatePath);
-                Undo.RegisterCreatedObjectUndo(mesh, "Create Derived Mesh Asset");
-                assetPath = candidatePath;
+                assetPath = uniquePath;
                 return true;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"Failed to create derived mesh asset at '{candidatePath}': {ex.Message}");
             }
         }
 
         Debug.LogError("Failed to create a writable location for the reduced mesh asset. Please choose a folder under the Assets directory.");
         return false;
+    }
+
+    private static IEnumerable<string> EnumerateCandidatePaths(string initialDirectory, string fileName)
+    {
+        foreach (string candidateDirectory in BuildCandidateDirectories(initialDirectory))
+        {
+            if (!EnsureFolderExists(candidateDirectory))
+                continue;
+
+            yield return CombineAssetPath(candidateDirectory, fileName);
+        }
+    }
+
+    private static bool TryCreateAsset(Mesh mesh, string assetPath)
+    {
+        try
+        {
+            AssetDatabase.CreateAsset(mesh, assetPath);
+            Undo.RegisterCreatedObjectUndo(mesh, "Create Derived Mesh Asset");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"Failed to create derived mesh asset at '{assetPath}': {ex.Message}");
+            return false;
+        }
     }
 
     private static List<string> BuildCandidateDirectories(string initialDirectory)

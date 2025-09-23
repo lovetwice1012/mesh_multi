@@ -10,141 +10,59 @@ public static class MeshPolygonReducer
 {
     public static void ReduceSelected(GameObject selected, float reductionPercent, Bounds? limitBounds = null, int? seed = null)
     {
-        if (selected == null)
+        if (!TryValidateReductionRequest(selected, reductionPercent, out float reductionRatio))
+            return;
+
+        var targetRenderers = FindTargetRenderers(selected, limitBounds, out var vertexMaskCache);
+        if (targetRenderers.Count == 0)
         {
-            Debug.LogWarning("No GameObject selected.");
+            Debug.LogWarning(limitBounds.HasValue
+                ? "No skinned mesh vertices found within the specified bounds."
+                : "No skinned meshes with valid data found under the selected GameObject.");
             return;
         }
 
-        reductionPercent = Mathf.Clamp(reductionPercent, 0f, 100f);
-        float reductionRatio = reductionPercent / 100f;
-        if (reductionRatio <= 0f)
-        {
-            Debug.Log("Reduction ratio is zero. Nothing to do.");
-            return;
-        }
-
-        var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>(includeInactive: true);
-        var targetRenderers = new List<SkinnedMeshRenderer>();
-        Dictionary<MaskCacheKey, bool[]> vertexMaskCache = null;
-        if (limitBounds.HasValue)
-        {
-            vertexMaskCache = new Dictionary<MaskCacheKey, bool[]>();
-            Bounds bounds = limitBounds.Value;
-            for (int i = 0; i < renderers.Length; i++)
-            {
-                var renderer = renderers[i];
-                var mesh = renderer.sharedMesh;
-                if (mesh == null)
-                    continue;
-
-                bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
-                var mask = GetOrCreateMask(renderer, mesh, bounds, vertexMaskCache, evaluateInCurrentPose);
-                bool anyInside = false;
-                for (int v = 0; v < mask.Length; v++)
-                {
-                    if (mask[v])
-                    {
-                        anyInside = true;
-                        break;
-                    }
-                }
-
-                if (anyInside)
-                    targetRenderers.Add(renderer);
-            }
-
-            if (targetRenderers.Count == 0)
-            {
-                Debug.LogWarning("No skinned mesh vertices found within the specified bounds.");
-                return;
-            }
-        }
-        else
-        {
-            for (int i = 0; i < renderers.Length; i++)
-            {
-                var mesh = renderers[i].sharedMesh;
-                if (mesh == null)
-                    continue;
-                targetRenderers.Add(renderers[i]);
-            }
-        }
-
-        int total = targetRenderers.Count;
         bool assetCreated = false;
         bool anyRendererModified = false;
-        bool assetEditingStarted = false;
         int totalOriginalTriangles = 0;
         int totalReducedTriangles = 0;
         int successfulRenderers = 0;
 
-        try
+        using var assetEditingScope = new AssetEditingScope();
+        using var progress = new ProgressScope("Reduce Mesh Polygons");
+
+        for (int i = 0; i < targetRenderers.Count; i++)
         {
-            for (int i = 0; i < total; i++)
+            var renderer = targetRenderers[i];
+            progress.Report($"Processing {i + 1}/{targetRenderers.Count}: {renderer.name}", (float)i / targetRenderers.Count);
+
+            var originalMesh = renderer.sharedMesh;
+            if (originalMesh == null)
+                continue;
+
+            bool[] vertexMask = null;
+            if (limitBounds.HasValue)
             {
-                var renderer = targetRenderers[i];
-                EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processing {i + 1}/{total}: {renderer.name}", (float)i / total);
-
-                var originalMesh = renderer.sharedMesh;
-                if (originalMesh == null)
-                    continue;
-
-                int originalTriangleCount = CountTotalTriangles(originalMesh);
-                if (originalTriangleCount <= 0)
-                    continue;
-
-                bool[] vertexMask = null;
-                if (limitBounds.HasValue)
-                {
-                    bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
-                    vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache, evaluateInCurrentPose);
-                }
-
-                Undo.RegisterCompleteObjectUndo(renderer, "Reduce Skinned Mesh Polygons");
-
-                var newMesh = ReduceMesh(originalMesh, reductionRatio, vertexMask, seed);
-                if (newMesh == null)
-                    continue;
-
-                float percent = ((float)(i + 1) / total) * 100f;
-                percent = Mathf.Floor(percent * 1000f) / 1000f;
-                EditorUtility.DisplayProgressBar("Reduce Mesh Polygons", $"Processed {i + 1}/{total}: {renderer.name} ({percent:F3}%)", (float)(i + 1) / total);
-                newMesh.name = originalMesh.name + "_reduced";
-
-                if (!assetEditingStarted)
-                {
-                    AssetDatabase.StartAssetEditing();
-                    assetEditingStarted = true;
-                }
-
-                bool createdAsset = MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "reduced", out _);
-                if (!createdAsset)
-                {
-                    Debug.LogError($"Failed to create reduced mesh asset for '{renderer.name}'. The original mesh will remain unchanged.");
-                    renderer.sharedMesh = originalMesh;
-                    UnityEngine.Object.DestroyImmediate(newMesh);
-                    continue;
-                }
-
-                assetCreated = true;
-                renderer.sharedMesh = newMesh;
-                EditorUtility.SetDirty(renderer);
-                if (renderer.sharedMesh != null)
-                    EditorUtility.SetDirty(renderer.sharedMesh);
-                PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
-                EditorSceneManager.MarkSceneDirty(renderer.gameObject.scene);
-                anyRendererModified = true;
-                successfulRenderers++;
-                totalOriginalTriangles += originalTriangleCount;
-                totalReducedTriangles += Mathf.Max(0, CountTotalTriangles(newMesh));
+                bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
+                vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache, evaluateInCurrentPose);
             }
-        }
-        finally
-        {
-            if (assetEditingStarted)
-                AssetDatabase.StopAssetEditing();
-            EditorUtility.ClearProgressBar();
+
+            if (!TryReduceRenderer(renderer, reductionRatio, vertexMask, seed, assetEditingScope,
+                                   out int originalTriangleCount, out int reducedTriangleCount, out bool createdAsset))
+            {
+                continue;
+            }
+
+            assetCreated |= createdAsset;
+            anyRendererModified = true;
+            successfulRenderers++;
+            totalOriginalTriangles += originalTriangleCount;
+            totalReducedTriangles += reducedTriangleCount;
+
+            float percent = ((float)(i + 1) / targetRenderers.Count) * 100f;
+            percent = Mathf.Floor(percent * 1000f) / 1000f;
+            progress.Report($"Processed {i + 1}/{targetRenderers.Count}: {renderer.name} ({percent:F3}%)",
+                            (float)(i + 1) / targetRenderers.Count);
         }
 
         if (assetCreated)
@@ -163,7 +81,121 @@ public static class MeshPolygonReducer
             finalPercent = Mathf.Clamp(reduction * 100f, 0f, 100f);
         }
         finalPercent = Mathf.Floor(finalPercent * 1000f) / 1000f;
-        Debug.Log(string.Format("Reduced polygons for {0}/{1} meshes under '{2}' ({3:F3}% reduction).", successfulRenderers, targetRenderers.Count, selected.name, finalPercent));
+        Debug.Log(string.Format("Reduced polygons for {0}/{1} meshes under '{2}' ({3:F3}% reduction).",
+                                 successfulRenderers, targetRenderers.Count, selected.name, finalPercent));
+    }
+
+    private static bool TryValidateReductionRequest(GameObject selected, float reductionPercent, out float reductionRatio)
+    {
+        reductionRatio = 0f;
+        if (selected == null)
+        {
+            Debug.LogWarning("No GameObject selected.");
+            return false;
+        }
+
+        reductionPercent = Mathf.Clamp(reductionPercent, 0f, 100f);
+        reductionRatio = reductionPercent / 100f;
+        if (reductionRatio <= 0f)
+        {
+            Debug.Log("Reduction ratio is zero. Nothing to do.");
+            return false;
+        }
+
+        return true;
+    }
+
+    private static List<SkinnedMeshRenderer> FindTargetRenderers(GameObject selected, Bounds? limitBounds,
+                                                                 out Dictionary<MaskCacheKey, bool[]> vertexMaskCache)
+    {
+        var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>(includeInactive: true);
+        var targetRenderers = new List<SkinnedMeshRenderer>(renderers.Length);
+        vertexMaskCache = limitBounds.HasValue ? new Dictionary<MaskCacheKey, bool[]>() : null;
+
+        if (!limitBounds.HasValue)
+        {
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                if (renderers[i].sharedMesh != null)
+                    targetRenderers.Add(renderers[i]);
+            }
+            return targetRenderers;
+        }
+
+        Bounds bounds = limitBounds.Value;
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            var renderer = renderers[i];
+            var mesh = renderer.sharedMesh;
+            if (mesh == null)
+                continue;
+
+            bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
+            var mask = GetOrCreateMask(renderer, mesh, bounds, vertexMaskCache, evaluateInCurrentPose);
+            if (mask != null && HasAnyTrue(mask))
+                targetRenderers.Add(renderer);
+        }
+
+        return targetRenderers;
+    }
+
+    private static bool HasAnyTrue(bool[] mask)
+    {
+        if (mask == null)
+            return false;
+
+        for (int i = 0; i < mask.Length; i++)
+        {
+            if (mask[i])
+                return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryReduceRenderer(SkinnedMeshRenderer renderer, float reductionRatio, bool[] vertexMask, int? seed,
+                                          AssetEditingScope assetEditingScope, out int originalTriangleCount,
+                                          out int reducedTriangleCount, out bool createdAsset)
+    {
+        originalTriangleCount = 0;
+        reducedTriangleCount = 0;
+        createdAsset = false;
+
+        var originalMesh = renderer != null ? renderer.sharedMesh : null;
+        if (originalMesh == null)
+            return false;
+
+        originalTriangleCount = CountTotalTriangles(originalMesh);
+        if (originalTriangleCount <= 0)
+            return false;
+
+        Undo.RegisterCompleteObjectUndo(renderer, "Reduce Skinned Mesh Polygons");
+
+        var newMesh = ReduceMesh(originalMesh, reductionRatio, vertexMask, seed);
+        if (newMesh == null)
+            return false;
+
+        newMesh.name = originalMesh.name + "_reduced";
+
+        assetEditingScope.EnsureStarted();
+        if (!MeshAssetUtility.TryCreateDerivedMeshAsset(newMesh, originalMesh, "reduced", out _))
+        {
+            Debug.LogError($"Failed to create reduced mesh asset for '{renderer.name}'. The original mesh will remain unchanged.");
+            renderer.sharedMesh = originalMesh;
+            UnityEngine.Object.DestroyImmediate(newMesh);
+            return false;
+        }
+
+        createdAsset = true;
+        renderer.sharedMesh = newMesh;
+        EditorUtility.SetDirty(renderer);
+        if (renderer.sharedMesh != null)
+            EditorUtility.SetDirty(renderer.sharedMesh);
+        PrefabUtility.RecordPrefabInstancePropertyModifications(renderer);
+        EditorSceneManager.MarkSceneDirty(renderer.gameObject.scene);
+
+        reducedTriangleCount = Mathf.Max(0, CountTotalTriangles(newMesh));
+        return true;
     }
 
     private static Mesh ReduceMesh(Mesh mesh, float reductionRatio, bool[] vertexMask, int? seed)
@@ -802,6 +834,53 @@ public static class MeshPolygonReducer
             if (indices.IsCreated)
                 indices.Dispose();
         }
+    }
+}
+
+internal sealed class AssetEditingScope : IDisposable
+{
+    private bool started;
+
+    public void EnsureStarted()
+    {
+        if (started)
+            return;
+
+        AssetDatabase.StartAssetEditing();
+        started = true;
+    }
+
+    public void Dispose()
+    {
+        if (!started)
+            return;
+
+        AssetDatabase.StopAssetEditing();
+    }
+}
+
+internal sealed class ProgressScope : IDisposable
+{
+    private readonly string title;
+    private bool active;
+
+    public ProgressScope(string title)
+    {
+        this.title = title;
+    }
+
+    public void Report(string message, float progress)
+    {
+        EditorUtility.DisplayProgressBar(title, message, Mathf.Clamp01(progress));
+        active = true;
+    }
+
+    public void Dispose()
+    {
+        if (!active)
+            return;
+
+        EditorUtility.ClearProgressBar();
     }
 }
 
