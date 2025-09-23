@@ -1030,7 +1030,7 @@ internal sealed class ArapMeshSimplifier
             return false;
         if (va.Revision != candidate.RevisionA || vb.Revision != candidate.RevisionB)
             return false;
-        if (va.Locked && vb.Locked)
+        if (va.Locked || vb.Locked)
             return false;
         return true;
     }
@@ -1042,7 +1042,7 @@ internal sealed class ArapMeshSimplifier
         candidate = default;
         if (va == null || vb == null || va.Removed || vb.Removed)
             return false;
-        if (va.Locked && vb.Locked)
+        if (va.Locked || vb.Locked)
             return false;
 
         if (!AreBoneWeightsCompatible(va, vb))

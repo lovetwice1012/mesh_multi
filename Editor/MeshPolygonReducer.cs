@@ -24,7 +24,7 @@ public static class MeshPolygonReducer
             return;
         }
 
-        var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
+        var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>(includeInactive: true);
         var targetRenderers = new List<SkinnedMeshRenderer>();
         Dictionary<MaskCacheKey, bool[]> vertexMaskCache = null;
         if (limitBounds.HasValue)
@@ -38,7 +38,8 @@ public static class MeshPolygonReducer
                 if (mesh == null)
                     continue;
 
-                var mask = GetOrCreateMask(renderer, mesh, bounds, vertexMaskCache);
+                bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
+                var mask = GetOrCreateMask(renderer, mesh, bounds, vertexMaskCache, evaluateInCurrentPose);
                 bool anyInside = false;
                 for (int v = 0; v < mask.Length; v++)
                 {
@@ -95,7 +96,8 @@ public static class MeshPolygonReducer
 
                 bool[] vertexMask = null;
                 if (limitBounds.HasValue)
-                    vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache);
+                    bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
+                    vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache, evaluateInCurrentPose);
 
                 Undo.RegisterCompleteObjectUndo(renderer, "Reduce Skinned Mesh Polygons");
 
@@ -313,8 +315,11 @@ public static class MeshPolygonReducer
         return false;
     }
 
-    private static bool[] GetOrCreateMask(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds, Dictionary<MaskCacheKey, bool[]> cache)
+    private static bool[] GetOrCreateMask(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds, Dictionary<MaskCacheKey, bool[]> cache, bool evaluateInCurrentPose)
     {
+        if (evaluateInCurrentPose)
+            return CalculateVerticesInsideBounds(renderer, mesh, bounds, evaluateInCurrentPose: true);
+
         if (cache == null)
             return CalculateVerticesInsideBounds(renderer, mesh, bounds);
 
@@ -326,6 +331,21 @@ public static class MeshPolygonReducer
         }
 
         return mask;
+    }
+
+    internal static bool ShouldEvaluateInCurrentPose(SkinnedMeshRenderer renderer)
+    {
+        if (renderer == null)
+            return false;
+
+        if (renderer.bones != null && renderer.bones.Length > 0)
+            return true;
+
+        if (renderer.rootBone != null)
+            return true;
+
+        var mesh = renderer.sharedMesh;
+        return mesh != null && mesh.bindposes != null && mesh.bindposes.Length > 0;
     }
 
     internal static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds, bool evaluateInCurrentPose = false)
@@ -652,19 +672,87 @@ public static class MeshPolygonReducer
                 if (i < meshData.subMeshCount)
                 {
                     var descriptor = meshData.GetSubMesh(i);
-                    switch (topology)
-                    {
-                        case MeshTopology.Triangles:
-                            total += descriptor.indexCount / 3;
-                            break;
-                        case MeshTopology.Quads:
-                            total += (descriptor.indexCount / 4) * 2;
-                            break;
-                    }
+                    total += CountTrianglesForTopology(meshData, i, descriptor, topology);
                 }
             }
 
             return total;
+        }
+    }
+
+    private static int CountTrianglesForTopology(Mesh.MeshData meshData, int submeshIndex, SubMeshDescriptor descriptor, MeshTopology topology)
+    {
+        switch (topology)
+        {
+            case MeshTopology.Triangles:
+                return descriptor.indexCount / 3;
+            case MeshTopology.Quads:
+                return (descriptor.indexCount / 4) * 2;
+            case MeshTopology.TriangleStrip:
+                return CountTriangleStripTriangles(meshData, submeshIndex);
+            case MeshTopology.TriangleFan:
+                return CountTriangleFanTriangles(meshData, submeshIndex);
+            default:
+                return 0;
+        }
+    }
+
+    private static int CountTriangleStripTriangles(Mesh.MeshData meshData, int submeshIndex)
+    {
+        NativeArray<int> indices = default;
+        try
+        {
+            indices = meshData.GetIndices<int>(submeshIndex);
+            if (!indices.IsCreated || indices.Length < 3)
+                return 0;
+
+            int a = indices[0];
+            int b = indices[1];
+            int count = 0;
+            for (int i = 2; i < indices.Length; i++)
+            {
+                int c = indices[i];
+                if (a != b && b != c && c != a)
+                    count++;
+                a = b;
+                b = c;
+            }
+
+            return count;
+        }
+        finally
+        {
+            if (indices.IsCreated)
+                indices.Dispose();
+        }
+    }
+
+    private static int CountTriangleFanTriangles(Mesh.MeshData meshData, int submeshIndex)
+    {
+        NativeArray<int> indices = default;
+        try
+        {
+            indices = meshData.GetIndices<int>(submeshIndex);
+            if (!indices.IsCreated || indices.Length < 3)
+                return 0;
+
+            int center = indices[0];
+            int previous = indices[1];
+            int count = 0;
+            for (int i = 2; i < indices.Length; i++)
+            {
+                int current = indices[i];
+                if (center != previous && previous != current && current != center)
+                    count++;
+                previous = current;
+            }
+
+            return count;
+        }
+        finally
+        {
+            if (indices.IsCreated)
+                indices.Dispose();
         }
     }
 }
@@ -776,7 +864,7 @@ public class MeshPolygonReducerWindow : EditorWindow
 
         reductionPercent = EditorGUILayout.Slider("削減率(%)", reductionPercent, 0f, 100f);
 
-        var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>();
+        var renderers = selected.GetComponentsInChildren<SkinnedMeshRenderer>(includeInactive: true);
         Bounds activeBounds = new Bounds(boundsCenter, boundsSize);
         bool boundsValid = boundsSize.x > 0f && boundsSize.y > 0f && boundsSize.z > 0f;
         int includedRenderers = 0;
@@ -789,7 +877,8 @@ public class MeshPolygonReducerWindow : EditorWindow
             bool[] mask = null;
             if (restrictToBounds && boundsValid)
             {
-                mask = MeshPolygonReducer.CalculateVerticesInsideBounds(renderer, mesh, activeBounds);
+                bool evaluateInCurrentPose = MeshPolygonReducer.ShouldEvaluateInCurrentPose(renderer);
+                mask = MeshPolygonReducer.CalculateVerticesInsideBounds(renderer, mesh, activeBounds, evaluateInCurrentPose);
                 for (int v = 0; v < mask.Length; v++)
                 {
                     if (mask[v])
@@ -1000,7 +1089,7 @@ public class MeshPolygonReducerWindow : EditorWindow
 
     private Bounds CalculateSelectionBounds(GameObject root)
     {
-        var renderers = root.GetComponentsInChildren<SkinnedMeshRenderer>();
+        var renderers = root.GetComponentsInChildren<SkinnedMeshRenderer>(includeInactive: true);
         if (renderers.Length == 0)
             return new Bounds(root.transform.position, Vector3.one);
 
