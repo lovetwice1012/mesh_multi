@@ -14,12 +14,13 @@ public static class MeshAssetUtility
             return false;
 
         string originalPath = AssetDatabase.GetAssetPath(originalMesh);
-        if (string.IsNullOrEmpty(originalPath))
-            return false;
-
-        string directory = Path.GetDirectoryName(originalPath);
-        if (string.IsNullOrEmpty(directory))
-            directory = "Assets";
+        string directory = null;
+        if (!string.IsNullOrEmpty(originalPath))
+        {
+            directory = Path.GetDirectoryName(originalPath);
+            if (string.IsNullOrEmpty(directory))
+                directory = "Assets";
+        }
 
         string fileName = BuildFileName(originalMesh, originalPath, suffix);
         var candidateDirectories = BuildCandidateDirectories(directory);
@@ -126,8 +127,14 @@ public static class MeshAssetUtility
 
     private static string BuildFileName(Mesh originalMesh, string originalPath, string suffix)
     {
-        string baseName = Path.GetFileNameWithoutExtension(originalPath);
-        string extension = Path.GetExtension(originalPath);
+        string baseName = null;
+        string extension = null;
+
+        if (!string.IsNullOrEmpty(originalPath))
+        {
+            baseName = Path.GetFileNameWithoutExtension(originalPath);
+            extension = Path.GetExtension(originalPath);
+        }
 
         if (!string.IsNullOrEmpty(extension) && extension.Equals(".fbx", StringComparison.OrdinalIgnoreCase))
         {
