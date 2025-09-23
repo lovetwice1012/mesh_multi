@@ -503,7 +503,7 @@ internal sealed class ArapMeshSimplifier
             sourceNormals = ReadNormals(meshData);
             sourceTangents = ReadTangents(meshData);
             sourceColors = ReadColors(meshData);
-            sourceBoneWeights = ReadBoneWeights(meshData);
+            sourceBoneWeights = ReadBoneWeights(mesh, meshData);
             sourceUVs = ReadUVChannels(meshData);
             (sourceSubmeshTopologies, sourceSubmeshIndices, topologyLockedVertices) = ReadSubmeshData(mesh, meshData);
         }
@@ -1798,7 +1798,7 @@ internal sealed class ArapMeshSimplifier
             int frameCount = sourceMesh.GetBlendShapeFrameCount(shapeIndex);
             for (int frameIndex = 0; frameIndex < frameCount; frameIndex++)
             {
-                float weight = sourceMesh.GetBlendShapeFrameWeight(shapeIndex, frameIndex);
+                float frameWeight = sourceMesh.GetBlendShapeFrameWeight(shapeIndex, frameIndex);
                 sourceMesh.GetBlendShapeFrameVertices(shapeIndex, frameIndex, deltaVertices, deltaNormals, deltaTangents);
 
                 Array.Clear(newDeltaVertices, 0, newDeltaVertices.Length);
@@ -1818,15 +1818,15 @@ internal sealed class ArapMeshSimplifier
                     for (int s = 0; s < sources.Count; s++)
                     {
                         int src = sources[s];
-                        float weight = 1f;
+                        float sourceWeight = 1f;
                         if (weights != null && s < weights.Count)
-                            weight = weights[s];
-                        if (weight <= 0f)
+                            sourceWeight = weights[s];
+                        if (sourceWeight <= 0f)
                             continue;
-                        accumDelta += deltaVertices[src] * weight;
-                        accumNormal += deltaNormals[src] * weight;
-                        accumTangent += deltaTangents[src] * weight;
-                        weightSum += weight;
+                        accumDelta += deltaVertices[src] * sourceWeight;
+                        accumNormal += deltaNormals[src] * sourceWeight;
+                        accumTangent += deltaTangents[src] * sourceWeight;
+                        weightSum += sourceWeight;
                     }
                     if (weightSum <= 0f)
                     {
@@ -1844,7 +1844,7 @@ internal sealed class ArapMeshSimplifier
                     }
                 }
 
-                mesh.AddBlendShapeFrame(shapeName, weight, newDeltaVertices, newDeltaNormals, newDeltaTangents);
+                mesh.AddBlendShapeFrame(shapeName, frameWeight, newDeltaVertices, newDeltaNormals, newDeltaTangents);
             }
         }
     }
@@ -1972,8 +1972,9 @@ internal sealed class ArapMeshSimplifier
         return result;
     }
 
-    private static BoneWeight[] ReadBoneWeights(Mesh.MeshData meshData)
+    private static BoneWeight[] ReadBoneWeights(Mesh mesh, Mesh.MeshData meshData)
     {
+#if UNITY_2020_2_OR_NEWER
         if (!meshData.HasVertexAttribute(VertexAttribute.BlendWeight) ||
             !meshData.HasVertexAttribute(VertexAttribute.BlendIndices))
             return null;
@@ -2033,6 +2034,18 @@ internal sealed class ArapMeshSimplifier
         }
 
         return result;
+#else
+        if (mesh == null)
+            return null;
+
+        var legacyWeights = mesh.boneWeights;
+        if (legacyWeights == null || legacyWeights.Length == 0)
+            return null;
+
+        var copy = new BoneWeight[legacyWeights.Length];
+        Array.Copy(legacyWeights, copy, legacyWeights.Length);
+        return copy;
+#endif
     }
 
     private static void NormalizeBoneWeight(ref BoneWeight weight)

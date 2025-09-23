@@ -476,6 +476,7 @@ public static class MeshPolygonReducer
         if (mesh == null)
             return false;
 
+#if UNITY_2020_2_OR_NEWER
         try
         {
             using (var meshDataArray = Mesh.AcquireReadOnlyMeshData(mesh))
@@ -551,6 +552,19 @@ public static class MeshPolygonReducer
             boneWeights = null;
             return false;
         }
+#else
+        var legacyWeights = mesh != null ? mesh.boneWeights : null;
+        if (legacyWeights == null || legacyWeights.Length == 0)
+        {
+            boneWeights = null;
+            return false;
+        }
+
+        var result = new BoneWeight[legacyWeights.Length];
+        Array.Copy(legacyWeights, result, legacyWeights.Length);
+        boneWeights = result;
+        return true;
+#endif
     }
 
     private static void NormalizeBoneWeight(ref BoneWeight weight)
