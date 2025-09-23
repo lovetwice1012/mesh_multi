@@ -11,6 +11,7 @@ internal sealed class ArapMeshSimplifier
 {
     // 改良: トポロジ判定を厳しくし、極端な潰れや法線反転を防ぐ
     private const float MinimumTriangleArea = 1e-8f;
+    private const float MinimumTriangleCrossMagnitudeSquared = 4f * MinimumTriangleArea * MinimumTriangleArea;
     private const float NormalAlignmentThreshold = 0.0f;
     private const float CotangentEpsilon = 1e-6f;
     private const float PolarTolerance = 1e-6f;
@@ -19,7 +20,7 @@ internal sealed class ArapMeshSimplifier
     private const int MaxArapIterations = 30;
     private const int MaxConjugateGradientIterations = 512;
     private const float ConjugateGradientTolerance = 1e-8f;
-    private const float BoneWeightCompatibilityThreshold = 0.1f;
+    private const float BoneWeightCompatibilityThreshold = 0.01f;
     // 改良: 元座標との差を強く抑制するためのペナルティ係数
     private const float OriginalPositionPenaltyWeight = 250f;
 
@@ -106,7 +107,7 @@ internal sealed class ArapMeshSimplifier
     {
         [ReadOnly] public NativeArray<TriangleInfo> Triangles;
         [ReadOnly] public NativeArray<float3> RestPositions;
-        public float MinimumTriangleArea;
+        public float MinimumTriangleCrossMagnitudeSquared;
         public NativeArray<SymmetricMatrix> Results;
 
         public void Execute(int index)
@@ -124,13 +125,14 @@ internal sealed class ArapMeshSimplifier
             float3 ab = pb - pa;
             float3 ac = pc - pa;
             float3 cross = math.cross(ab, ac);
-            float area = math.length(cross) * 0.5f;
-            if (area < MinimumTriangleArea)
+            float crossMagnitudeSquared = math.lengthsq(cross);
+            if (crossMagnitudeSquared < MinimumTriangleCrossMagnitudeSquared)
             {
                 Results[index] = SymmetricMatrix.Zero;
                 return;
             }
 
+            float area = math.sqrt(crossMagnitudeSquared) * 0.5f;
             float3 normal = math.normalize(cross);
             double nx = normal.x;
             double ny = normal.y;
@@ -522,10 +524,8 @@ internal sealed class ArapMeshSimplifier
         InitializeEdgeQueue();
 
         bool collapsed = PerformEdgeCollapses(targetCandidateCount);
-        if (!collapsed)
-            return null;
-
-        RunArapRelaxation();
+        if (collapsed)
+            RunArapRelaxation();
 
         Mesh mesh = BuildMesh(out bool removedTriangles);
         return new Result { Mesh = mesh, RemovedTriangles = removedTriangles };
@@ -563,25 +563,20 @@ internal sealed class ArapMeshSimplifier
             MeshTopology topology = (sourceSubmeshTopologies != null && sub < sourceSubmeshTopologies.Length)
                 ? sourceSubmeshTopologies[sub]
                 : MeshTopology.Triangles;
-            if (topology != MeshTopology.Triangles)
-                continue;
-
             int[] indices = (sourceSubmeshIndices != null && sub < sourceSubmeshIndices.Length && sourceSubmeshIndices[sub] != null)
                 ? sourceSubmeshIndices[sub]
                 : Array.Empty<int>();
-            for (int i = 0; i + 2 < indices.Length; i += 3)
+            foreach (var (a, b, c) in EnumerateSubmeshTriangles(topology, indices))
             {
-                int a = indices[i];
-                int b = indices[i + 1];
-                int c = indices[i + 2];
                 if (a == b || b == c || c == a)
                     continue;
 
-                var restNormal = Vector3.Cross(sourceVertices[b] - sourceVertices[a], sourceVertices[c] - sourceVertices[a]);
-                if (restNormal.sqrMagnitude < MinimumTriangleArea)
+                Vector3 cross = Vector3.Cross(sourceVertices[b] - sourceVertices[a], sourceVertices[c] - sourceVertices[a]);
+                float crossMagnitudeSquared = cross.sqrMagnitude;
+                if (crossMagnitudeSquared < MinimumTriangleCrossMagnitudeSquared)
                     continue;
 
-                restNormal.Normalize();
+                Vector3 restNormal = cross / Mathf.Sqrt(crossMagnitudeSquared);
                 var tri = new TriangleData
                 {
                     Submesh = sub,
@@ -761,7 +756,7 @@ internal sealed class ArapMeshSimplifier
             {
                 Triangles = triangleInfos,
                 RestPositions = restPositions,
-                MinimumTriangleArea = MinimumTriangleArea,
+                MinimumTriangleCrossMagnitudeSquared = MinimumTriangleCrossMagnitudeSquared,
                 Results = results
             };
 
@@ -929,10 +924,14 @@ internal sealed class ArapMeshSimplifier
         if (!IsValidVector(newPosition))
             newPosition = Vector3.zero;
 
-        if (!IsCollapseTopologicallyValid(targetIndex, sourceIndex, newPosition))
+        int combinedWeight = Mathf.Max(1, target.AggregateWeight + source.AggregateWeight);
+        Vector3 mergedRestPosition = (target.RestPosition * target.AggregateWeight + source.RestPosition * source.AggregateWeight) /
+                                     combinedWeight;
+
+        if (!IsCollapseTopologicallyValid(targetIndex, sourceIndex, newPosition, mergedRestPosition))
             return false;
 
-        MergeVertices(targetIndex, sourceIndex, newPosition);
+        MergeVertices(targetIndex, sourceIndex, newPosition, mergedRestPosition, combinedWeight);
         return true;
     }
 
@@ -970,7 +969,7 @@ internal sealed class ArapMeshSimplifier
         return shared >= BoneWeightCompatibilityThreshold;
     }
 
-    private bool IsCollapseTopologicallyValid(int target, int source, Vector3 newPosition)
+    private bool IsCollapseTopologicallyValid(int target, int source, Vector3 newPosition, Vector3 mergedRestPosition)
     {
         var vt = vertices[target];
         var vs = vertices[source];
@@ -1000,23 +999,25 @@ internal sealed class ArapMeshSimplifier
             if (a == b || b == c || c == a)
                 return false;
 
-            Vector3 pa = (a == target) ? vt.RestPosition : vertices[a].RestPosition;
-            Vector3 pb = (b == target) ? vt.RestPosition : vertices[b].RestPosition;
-            Vector3 pc = (c == target) ? vt.RestPosition : vertices[c].RestPosition;
-            Vector3 restNormal = Vector3.Cross(pb - pa, pc - pa);
-            if (restNormal.sqrMagnitude < MinimumTriangleArea)
+            Vector3 pa = (a == target) ? mergedRestPosition : vertices[a].RestPosition;
+            Vector3 pb = (b == target) ? mergedRestPosition : vertices[b].RestPosition;
+            Vector3 pc = (c == target) ? mergedRestPosition : vertices[c].RestPosition;
+            Vector3 restCross = Vector3.Cross(pb - pa, pc - pa);
+            float restCrossSquared = restCross.sqrMagnitude;
+            if (restCrossSquared < MinimumTriangleCrossMagnitudeSquared)
                 return false;
-            restNormal.Normalize();
+            Vector3 restNormal = restCross / Mathf.Sqrt(restCrossSquared);
             if (Vector3.Dot(restNormal, tri.RestNormal) < NormalAlignmentThreshold)
                 return false;
 
             Vector3 xa = (a == target) ? newPosition : vertices[a].Position;
             Vector3 xb = (b == target) ? newPosition : vertices[b].Position;
             Vector3 xc = (c == target) ? newPosition : vertices[c].Position;
-            Vector3 newNormal = Vector3.Cross(xb - xa, xc - xa);
-            if (newNormal.sqrMagnitude < MinimumTriangleArea)
+            Vector3 newCross = Vector3.Cross(xb - xa, xc - xa);
+            float newCrossSquared = newCross.sqrMagnitude;
+            if (newCrossSquared < MinimumTriangleCrossMagnitudeSquared)
                 return false;
-            newNormal.Normalize();
+            Vector3 newNormal = newCross / Mathf.Sqrt(newCrossSquared);
             if (Vector3.Dot(newNormal, tri.RestNormal) < NormalAlignmentThreshold)
                 return false;
         }
@@ -1024,15 +1025,13 @@ internal sealed class ArapMeshSimplifier
         return true;
     }
 
-    private void MergeVertices(int targetIndex, int sourceIndex, Vector3 newPosition)
+    private void MergeVertices(int targetIndex, int sourceIndex, Vector3 newPosition, Vector3 mergedRestPosition, int combinedWeight)
     {
         var target = vertices[targetIndex];
         var source = vertices[sourceIndex];
         target.Position = newPosition;
-        Vector3 newRest = (target.RestPosition * target.AggregateWeight + source.RestPosition * source.AggregateWeight) /
-                          Mathf.Max(1, target.AggregateWeight + source.AggregateWeight);
-        target.RestPosition = newRest;
-        target.AggregateWeight += source.AggregateWeight;
+        target.RestPosition = mergedRestPosition;
+        target.AggregateWeight = combinedWeight;
         target.OriginalPositionSum += source.OriginalPositionSum;
         target.OriginalPositionSquaredSum += source.OriginalPositionSquaredSum;
         target.Locked |= source.Locked;
@@ -1117,16 +1116,16 @@ internal sealed class ArapMeshSimplifier
                 Vector3 ra = vertices[tri.A].RestPosition;
                 Vector3 rb = vertices[tri.B].RestPosition;
                 Vector3 rc = vertices[tri.C].RestPosition;
-                Vector3 restNormal = Vector3.Cross(rb - ra, rc - ra);
-                if (restNormal.sqrMagnitude < MinimumTriangleArea)
+                Vector3 restCross = Vector3.Cross(rb - ra, rc - ra);
+                float restCrossSquared = restCross.sqrMagnitude;
+                if (restCrossSquared < MinimumTriangleCrossMagnitudeSquared)
                 {
                     tri.Removed = true;
                     removed = true;
                 }
                 else
                 {
-                    restNormal.Normalize();
-                    tri.RestNormal = restNormal;
+                    tri.RestNormal = restCross / Mathf.Sqrt(restCrossSquared);
                 }
             }
 
@@ -1144,15 +1143,15 @@ internal sealed class ArapMeshSimplifier
             Vector3 ra = vertices[tri.A].RestPosition;
             Vector3 rb = vertices[tri.B].RestPosition;
             Vector3 rc = vertices[tri.C].RestPosition;
-            Vector3 restNormal = Vector3.Cross(rb - ra, rc - ra);
-            if (restNormal.sqrMagnitude < MinimumTriangleArea)
+            Vector3 restCross = Vector3.Cross(rb - ra, rc - ra);
+            float restCrossSquared = restCross.sqrMagnitude;
+            if (restCrossSquared < MinimumTriangleCrossMagnitudeSquared)
             {
                 tri.Removed = true;
             }
             else
             {
-                restNormal.Normalize();
-                tri.RestNormal = restNormal;
+                tri.RestNormal = restCross / Mathf.Sqrt(restCrossSquared);
             }
             triangles[triIndex] = tri;
         }
@@ -1498,15 +1497,21 @@ internal sealed class ArapMeshSimplifier
         if (!hasLockedVertices && n > 0)
         {
             const float anchorWeight = OriginalPositionPenaltyWeight;
-            int anchorVertex = freeVertices[0];
-            var anchor = vertices[anchorVertex];
-            rows[0].Diagonal += anchorWeight;
-            rhsX[0] += anchorWeight * anchor.RestPosition.x;
-            rhsY[0] += anchorWeight * anchor.RestPosition.y;
-            rhsZ[0] += anchorWeight * anchor.RestPosition.z;
-            solutionX[0] = anchor.RestPosition.x;
-            solutionY[0] = anchor.RestPosition.y;
-            solutionZ[0] = anchor.RestPosition.z;
+            var anchors = SelectAnchorVertices(freeVertices);
+            foreach (int anchorVertex in anchors)
+            {
+                int rowIndex = indexMap[anchorVertex];
+                if (rowIndex < 0 || rowIndex >= rows.Length)
+                    continue;
+                var anchor = vertices[anchorVertex];
+                rows[rowIndex].Diagonal += anchorWeight;
+                rhsX[rowIndex] += anchorWeight * anchor.RestPosition.x;
+                rhsY[rowIndex] += anchorWeight * anchor.RestPosition.y;
+                rhsZ[rowIndex] += anchorWeight * anchor.RestPosition.z;
+                solutionX[rowIndex] = anchor.RestPosition.x;
+                solutionY[rowIndex] = anchor.RestPosition.y;
+                solutionZ[rowIndex] = anchor.RestPosition.z;
+            }
         }
 
         ConjugateGradient(rows, rhsX, solutionX);
@@ -1521,6 +1526,76 @@ internal sealed class ArapMeshSimplifier
                 newPos = vertices[vi].RestPosition;
             vertices[vi].Position = newPos;
         }
+    }
+
+    private List<int> SelectAnchorVertices(List<int> freeVertices)
+    {
+        var anchors = new List<int>(3);
+        if (freeVertices == null || freeVertices.Count == 0)
+            return anchors;
+
+        int first = freeVertices[0];
+        anchors.Add(first);
+        if (freeVertices.Count == 1)
+            return anchors;
+
+        Vector3 firstRest = vertices[first].RestPosition;
+        float maxDistanceSq = -1f;
+        int second = first;
+        for (int i = 1; i < freeVertices.Count; i++)
+        {
+            int candidate = freeVertices[i];
+            Vector3 rest = vertices[candidate].RestPosition;
+            float distSq = (rest - firstRest).sqrMagnitude;
+            if (distSq > maxDistanceSq)
+            {
+                maxDistanceSq = distSq;
+                second = candidate;
+            }
+        }
+
+        if (second == first && freeVertices.Count > 1)
+            second = freeVertices[1];
+        if (second != first)
+            anchors.Add(second);
+
+        if (freeVertices.Count <= 2)
+            return anchors;
+
+        Vector3 secondRest = vertices[second].RestPosition;
+        Vector3 baseDir = secondRest - firstRest;
+        float bestArea = -1f;
+        int third = -1;
+        for (int i = 0; i < freeVertices.Count; i++)
+        {
+            int candidate = freeVertices[i];
+            if (candidate == first || candidate == second)
+                continue;
+            Vector3 rest = vertices[candidate].RestPosition;
+            float areaSq = Vector3.Cross(baseDir, rest - firstRest).sqrMagnitude;
+            if (areaSq > bestArea)
+            {
+                bestArea = areaSq;
+                third = candidate;
+            }
+        }
+
+        if (third >= 0)
+            anchors.Add(third);
+        else if (freeVertices.Count > 2)
+        {
+            for (int i = 0; i < freeVertices.Count; i++)
+            {
+                int candidate = freeVertices[i];
+                if (candidate != first && candidate != second)
+                {
+                    anchors.Add(candidate);
+                    break;
+                }
+            }
+        }
+
+        return anchors;
     }
 
     private void ConjugateGradient(LinearSystemRow[] rows, float[] rhs, float[] solution)
@@ -2142,7 +2217,8 @@ internal sealed class ArapMeshSimplifier
                 indices[sub] = Array.Empty<int>();
             }
 
-            if (topology != MeshTopology.Triangles && indices[sub] != null)
+            bool shouldLockVertices = topology == MeshTopology.Points || topology == MeshTopology.Lines || topology == MeshTopology.LineStrip;
+            if (shouldLockVertices && indices[sub] != null)
             {
                 var array = indices[sub];
                 for (int i = 0; i < array.Length; i++)
@@ -2155,5 +2231,30 @@ internal sealed class ArapMeshSimplifier
         }
 
         return (topologies, indices, lockedVertices);
+    }
+
+    private static IEnumerable<(int a, int b, int c)> EnumerateSubmeshTriangles(MeshTopology topology, int[] indices)
+    {
+        if (indices == null || indices.Length < 3)
+            yield break;
+
+        switch (topology)
+        {
+            case MeshTopology.Triangles:
+                for (int i = 0; i + 2 < indices.Length; i += 3)
+                    yield return (indices[i], indices[i + 1], indices[i + 2]);
+                break;
+            case MeshTopology.Quads:
+                for (int i = 0; i + 3 < indices.Length; i += 4)
+                {
+                    int a = indices[i];
+                    int b = indices[i + 1];
+                    int c = indices[i + 2];
+                    int d = indices[i + 3];
+                    yield return (a, b, c);
+                    yield return (a, c, d);
+                }
+                break;
+        }
     }
 }

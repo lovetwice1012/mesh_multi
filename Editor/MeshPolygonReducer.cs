@@ -602,13 +602,18 @@ public static class MeshPolygonReducer
                 else
                     topology = MeshTopology.Triangles;
 
-                if (topology != MeshTopology.Triangles)
-                    continue;
-
                 if (i < meshData.subMeshCount)
                 {
                     var descriptor = meshData.GetSubMesh(i);
-                    total += descriptor.indexCount / 3;
+                    switch (topology)
+                    {
+                        case MeshTopology.Triangles:
+                            total += descriptor.indexCount / 3;
+                            break;
+                        case MeshTopology.Quads:
+                            total += (descriptor.indexCount / 4) * 2;
+                            break;
+                    }
                 }
             }
 
