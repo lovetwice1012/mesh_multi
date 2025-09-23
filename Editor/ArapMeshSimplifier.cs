@@ -2155,6 +2155,12 @@ internal sealed class ArapMeshSimplifier
                     continue;
                 }
 
+                if (TryConvertTopologyToTriangles(topology, originalIndices, map, ref removedAnyTriangle, ref anyTriangles, out var convertedIndices))
+                {
+                    mesh.SetIndices(convertedIndices, MeshTopology.Triangles, sub, true);
+                    continue;
+                }
+
                 switch (topology)
                 {
                     case MeshTopology.Points:
@@ -2211,31 +2217,6 @@ internal sealed class ArapMeshSimplifier
                         mesh.SetIndices(segments.ToArray(), MeshTopology.Lines, sub, true);
                         continue;
                     }
-                    case MeshTopology.Quads:
-                    case MeshTopology.TriangleStrip:
-                    case MeshTopology.TriangleFan:
-                    {
-                        var indices = new List<int>();
-                        foreach (var (oa, ob, oc) in EnumerateSubmeshTriangles(topology, originalIndices))
-                        {
-                            int a = MapIndex(map, oa);
-                            int b = MapIndex(map, ob);
-                            int c = MapIndex(map, oc);
-                            if (a < 0 || b < 0 || c < 0)
-                            {
-                                removedAnyTriangle = true;
-                                continue;
-                            }
-
-                            indices.Add(a);
-                            indices.Add(b);
-                            indices.Add(c);
-                            anyTriangles = true;
-                        }
-
-                        mesh.SetIndices(indices.ToArray(), MeshTopology.Triangles, sub, true);
-                        continue;
-                    }
                     default:
                         mesh.SetIndices(Array.Empty<int>(), topology, sub, true);
                         continue;
@@ -2243,7 +2224,7 @@ internal sealed class ArapMeshSimplifier
             }
 
             var list = submeshTriangleIndices[sub];
-            List<int> indices = new List<int>();
+            List<int> triangleIndices = new List<int>();
             foreach (int triIndex in list)
             {
                 var tri = triangles[triIndex];
@@ -2265,12 +2246,12 @@ internal sealed class ArapMeshSimplifier
                     removedAnyTriangle = true;
                     continue;
                 }
-                indices.Add(a);
-                indices.Add(b);
-                indices.Add(c);
+                triangleIndices.Add(a);
+                triangleIndices.Add(b);
+                triangleIndices.Add(c);
                 anyTriangles = true;
             }
-            mesh.SetTriangles(indices, sub, true);
+            mesh.SetTriangles(triangleIndices, sub, true);
         }
 
         mesh.RecalculateBounds();
@@ -2695,49 +2676,98 @@ internal sealed class ArapMeshSimplifier
         return (topologies, indices, lockedVertices);
     }
 
+    private bool TryConvertTopologyToTriangles(MeshTopology topology, int[] originalIndices, int[] map, ref bool removedAnyTriangle, ref bool anyTriangles, out int[] convertedIndices)
+    {
+        if (topology != MeshTopology.Quads && !IsTriangleStripTopology(topology) && !IsTriangleFanTopology(topology))
+        {
+            convertedIndices = null;
+            return false;
+        }
+
+        var indices = new List<int>();
+        foreach (var (oa, ob, oc) in EnumerateSubmeshTriangles(topology, originalIndices))
+        {
+            int a = MapIndex(map, oa);
+            int b = MapIndex(map, ob);
+            int c = MapIndex(map, oc);
+            if (a < 0 || b < 0 || c < 0)
+            {
+                removedAnyTriangle = true;
+                continue;
+            }
+
+            indices.Add(a);
+            indices.Add(b);
+            indices.Add(c);
+            anyTriangles = true;
+        }
+
+        convertedIndices = indices.ToArray();
+        return true;
+    }
+
     private static IEnumerable<(int a, int b, int c)> EnumerateSubmeshTriangles(MeshTopology topology, int[] indices)
     {
         if (indices == null || indices.Length < 3)
             yield break;
 
-        switch (topology)
+        if (topology == MeshTopology.Triangles)
         {
-            case MeshTopology.Triangles:
-                for (int i = 0; i + 2 < indices.Length; i += 3)
-                    yield return (indices[i], indices[i + 1], indices[i + 2]);
-                break;
-            case MeshTopology.Quads:
-                for (int i = 0; i + 3 < indices.Length; i += 4)
-                {
-                    int a = indices[i];
-                    int b = indices[i + 1];
-                    int c = indices[i + 2];
-                    int d = indices[i + 3];
-                    yield return (a, b, c);
-                    yield return (a, c, d);
-                }
-                break;
-            case MeshTopology.TriangleStrip:
-                for (int i = 0; i + 2 < indices.Length; i++)
-                {
-                    int a = indices[i];
-                    int b = indices[i + 1];
-                    int c = indices[i + 2];
-                    if ((i & 1) == 1)
-                        yield return (a, c, b);
-                    else
-                        yield return (a, b, c);
-                }
-                break;
-            case MeshTopology.TriangleFan:
-                for (int i = 1; i + 1 < indices.Length; i++)
-                {
-                    int a = indices[0];
-                    int b = indices[i];
-                    int c = indices[i + 1];
-                    yield return (a, b, c);
-                }
-                break;
+            for (int i = 0; i + 2 < indices.Length; i += 3)
+                yield return (indices[i], indices[i + 1], indices[i + 2]);
         }
+        else if (topology == MeshTopology.Quads)
+        {
+            for (int i = 0; i + 3 < indices.Length; i += 4)
+            {
+                int a = indices[i];
+                int b = indices[i + 1];
+                int c = indices[i + 2];
+                int d = indices[i + 3];
+                yield return (a, b, c);
+                yield return (a, c, d);
+            }
+        }
+        else if (IsTriangleStripTopology(topology))
+        {
+            for (int i = 0; i + 2 < indices.Length; i++)
+            {
+                int a = indices[i];
+                int b = indices[i + 1];
+                int c = indices[i + 2];
+                if ((i & 1) == 1)
+                    yield return (a, c, b);
+                else
+                    yield return (a, b, c);
+            }
+        }
+        else if (IsTriangleFanTopology(topology))
+        {
+            for (int i = 1; i + 1 < indices.Length; i++)
+            {
+                int a = indices[0];
+                int b = indices[i];
+                int c = indices[i + 1];
+                yield return (a, b, c);
+            }
+        }
+    }
+
+    private static bool IsTriangleStripTopology(MeshTopology topology)
+    {
+#if UNITY_2020_2_OR_NEWER
+        return topology == MeshTopology.TriangleStrip;
+#else
+        return (int)topology == 5;
+#endif
+    }
+
+    private static bool IsTriangleFanTopology(MeshTopology topology)
+    {
+#if UNITY_2020_2_OR_NEWER
+        return topology == MeshTopology.TriangleFan;
+#else
+        return (int)topology == 6;
+#endif
     }
 }
