@@ -328,7 +328,7 @@ public static class MeshPolygonReducer
         return mask;
     }
 
-    private static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds)
+    internal static bool[] CalculateVerticesInsideBounds(SkinnedMeshRenderer renderer, Mesh mesh, Bounds bounds)
     {
         if (mesh == null)
             return Array.Empty<bool>();
@@ -491,8 +491,8 @@ public static class MeshPolygonReducer
 
                 int vertexCount = meshData.vertexCount;
                 var result = new BoneWeight[vertexCount];
-                var bonesPerVertex = meshData.GetBonesPerVertex();
-                var allWeights = meshData.GetAllBoneWeights();
+                var bonesPerVertex = mesh.GetBonesPerVertex();
+                var allWeights = mesh.GetAllBoneWeights();
 
                 try
                 {
@@ -579,7 +579,7 @@ public static class MeshPolygonReducer
         weight.weight3 *= inv;
     }
 
-    private static int CountTotalTriangles(Mesh mesh)
+    internal static int CountTotalTriangles(Mesh mesh)
     {
         if (mesh == null)
             return 0;

@@ -1849,14 +1849,14 @@ internal sealed class ArapMeshSimplifier
         }
     }
 
-    private static void AddBoneWeight(Dictionary<int, float> dict, int boneIndex, float weight)
+    private static void AddBoneWeight(Dictionary<int, float> dict, int boneIndex, float weightValue)
     {
-        if (weight <= 0f)
+        if (weightValue <= 0f)
             return;
         if (dict.TryGetValue(boneIndex, out float value))
-            dict[boneIndex] = value + weight;
+            dict[boneIndex] = value + weightValue;
         else
-            dict.Add(boneIndex, weight);
+            dict.Add(boneIndex, weightValue);
     }
 
     private static BoneWeight BuildBoneWeight(Dictionary<int, float> weights)
@@ -1984,8 +1984,8 @@ internal sealed class ArapMeshSimplifier
             return Array.Empty<BoneWeight>();
 
         var result = new BoneWeight[vertexCount];
-        var bonesPerVertex = meshData.GetBonesPerVertex();
-        var allWeights = meshData.GetAllBoneWeights();
+        var bonesPerVertex = mesh.GetBonesPerVertex();
+        var allWeights = mesh.GetAllBoneWeights();
         try
         {
             if (!bonesPerVertex.IsCreated || !allWeights.IsCreated || bonesPerVertex.Length == 0)
