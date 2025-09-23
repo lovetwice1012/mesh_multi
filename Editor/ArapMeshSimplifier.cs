@@ -23,6 +23,10 @@ internal sealed class ArapMeshSimplifier
     private const float BoneWeightCompatibilityThreshold = 0.01f;
     // 改良: 元座標との差を強く抑制するためのペナルティ係数
     private const float OriginalPositionPenaltyWeight = 250f;
+    private const float AxisConstraintEpsilon = 1e-6f;
+    private const float DefaultRadialWeight = 2.0f;
+    private const float DefaultTangentialWeight = 1.0f;
+    private const float DefaultNormalWeight = 20.0f;
 
     private readonly Mesh sourceMesh;
     private readonly bool[] vertexMask;
@@ -53,11 +57,22 @@ internal sealed class ArapMeshSimplifier
     private int baseCandidateVertexCount;
     private int baseActiveVertexCount;
     private bool baseInitialized;
+    private bool hasAxisConstraints;
 
     public struct Result
     {
         public Mesh Mesh;
         public bool RemovedTriangles;
+    }
+
+    public struct AxisConstraint
+    {
+        public bool Enabled;
+        public Vector3 ClosestPoint;
+        public Vector3 AxisDirection;
+        public float RadialWeight;
+        public float TangentialWeight;
+        public float NormalWeight;
     }
 
     private sealed class VertexData
@@ -82,6 +97,13 @@ internal sealed class ArapMeshSimplifier
         public bool Candidate;
         public SymmetricMatrix Quadric;
         public int Revision;
+        public bool HasAxisConstraint;
+        public Vector3 AxisClosestPoint;
+        public Vector3 AxisDirection;
+        public float AxisRestRadius;
+        public float AxisRadialWeight;
+        public float AxisTangentialWeight;
+        public float AxisNormalWeight;
     }
 
     private struct TriangleData
@@ -511,6 +533,163 @@ internal sealed class ArapMeshSimplifier
         }
     }
 
+    public void SetAxisConstraints(AxisConstraint[] constraints)
+    {
+        hasAxisConstraints = false;
+        if (constraints == null)
+        {
+            ClearAllAxisConstraints();
+            return;
+        }
+
+        if (constraints.Length != sourceVertices.Length)
+        {
+            Debug.LogWarning($"Ignoring axis constraints for '{sourceMesh?.name}' because the constraint count ({constraints.Length}) does not match the mesh vertex count ({sourceVertices.Length}).");
+            return;
+        }
+
+        EnsureBaseData();
+
+        bool anyConstraint = false;
+        for (int i = 0; i < baseVertices.Length; i++)
+        {
+            var baseVertex = baseVertices[i];
+            if (baseVertex == null)
+                continue;
+
+            if (TryAssignAxisConstraint(baseVertex, constraints[i]))
+                anyConstraint = true;
+            else
+                ClearAxisConstraint(baseVertex);
+        }
+
+        hasAxisConstraints = anyConstraint;
+
+        if (vertices != null && vertices.Length == baseVertices.Length)
+        {
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var v = vertices[i];
+                var src = baseVertices[i];
+                if (v == null || src == null)
+                    continue;
+                CopyAxisConstraint(src, v);
+            }
+        }
+    }
+
+    private void ClearAllAxisConstraints()
+    {
+        hasAxisConstraints = false;
+        if (baseVertices != null)
+        {
+            for (int i = 0; i < baseVertices.Length; i++)
+                ClearAxisConstraint(baseVertices[i]);
+        }
+
+        if (vertices != null)
+        {
+            for (int i = 0; i < vertices.Length; i++)
+                ClearAxisConstraint(vertices[i]);
+        }
+    }
+
+    private static void CopyAxisConstraint(VertexData source, VertexData destination)
+    {
+        if (source == null || destination == null)
+            return;
+
+        destination.HasAxisConstraint = source.HasAxisConstraint;
+        destination.AxisClosestPoint = source.AxisClosestPoint;
+        destination.AxisDirection = source.AxisDirection;
+        destination.AxisRestRadius = source.AxisRestRadius;
+        destination.AxisRadialWeight = source.AxisRadialWeight;
+        destination.AxisTangentialWeight = source.AxisTangentialWeight;
+        destination.AxisNormalWeight = source.AxisNormalWeight;
+    }
+
+    private bool TryAssignAxisConstraint(VertexData vertex, AxisConstraint constraint)
+    {
+        if (vertex == null)
+            return false;
+
+        bool shouldEnable = constraint.Enabled;
+        if (!shouldEnable)
+        {
+            if (IsValidVector(constraint.AxisDirection) && constraint.AxisDirection.sqrMagnitude >= AxisConstraintEpsilon * AxisConstraintEpsilon)
+                shouldEnable = true;
+            else if ((constraint.RadialWeight > 0f) || (constraint.TangentialWeight > 0f) || (constraint.NormalWeight > 0f))
+                shouldEnable = true;
+        }
+
+        if (!shouldEnable)
+        {
+            ClearAxisConstraint(vertex);
+            return false;
+        }
+
+        Vector3 axis = constraint.AxisDirection;
+        if (!IsValidVector(axis))
+            axis = Vector3.zero;
+
+        float axisMagnitude = axis.magnitude;
+        if (axisMagnitude < AxisConstraintEpsilon)
+        {
+            ClearAxisConstraint(vertex);
+            return false;
+        }
+
+        axis /= axisMagnitude;
+
+        Vector3 closest = constraint.ClosestPoint;
+        if (!IsValidVector(closest))
+            closest = vertex.RestPosition;
+
+        float radialWeight = float.IsNaN(constraint.RadialWeight) ? -1f : constraint.RadialWeight;
+        float tangentialWeight = float.IsNaN(constraint.TangentialWeight) ? -1f : constraint.TangentialWeight;
+        float normalWeight = float.IsNaN(constraint.NormalWeight) ? -1f : constraint.NormalWeight;
+
+        if (radialWeight < 0f)
+            radialWeight = DefaultRadialWeight;
+        if (tangentialWeight < 0f)
+            tangentialWeight = DefaultTangentialWeight;
+        if (normalWeight < 0f)
+            normalWeight = DefaultNormalWeight;
+
+        if (radialWeight <= 0f && tangentialWeight <= 0f && normalWeight <= 0f)
+        {
+            ClearAxisConstraint(vertex);
+            return false;
+        }
+
+        Vector3 restDelta = vertex.RestPosition - closest;
+        Vector3 restRadial = restDelta - Vector3.Dot(restDelta, axis) * axis;
+        float restRadius = restRadial.magnitude;
+
+        vertex.HasAxisConstraint = true;
+        vertex.AxisClosestPoint = closest;
+        vertex.AxisDirection = axis;
+        vertex.AxisRestRadius = restRadius;
+        vertex.AxisRadialWeight = radialWeight;
+        vertex.AxisTangentialWeight = tangentialWeight;
+        vertex.AxisNormalWeight = normalWeight;
+        return true;
+    }
+
+    private static void ClearAxisConstraint(VertexData vertex)
+    {
+        if (vertex == null)
+            return;
+
+        vertex.HasAxisConstraint = false;
+        vertex.AxisClosestPoint = Vector3.zero;
+        vertex.AxisDirection = Vector3.zero;
+        vertex.AxisRestRadius = 0f;
+        vertex.AxisRadialWeight = 0f;
+        vertex.AxisTangentialWeight = 0f;
+        vertex.AxisNormalWeight = 0f;
+    }
+
     public Result? Simplify(int targetCandidateCount)
     {
         EnsureBaseData();
@@ -649,6 +828,7 @@ internal sealed class ArapMeshSimplifier
 
         data.SourceIndices.Add(index);
         data.SourceWeights.Add(1f);
+        ClearAxisConstraint(data);
         return data;
     }
 
@@ -700,7 +880,14 @@ internal sealed class ArapMeshSimplifier
             OriginalPositionSquaredSum = source.OriginalPositionSquaredSum,
             Quadric = SymmetricMatrix.Zero,
             Revision = 0,
-            Removed = source.Removed
+            Removed = source.Removed,
+            HasAxisConstraint = source.HasAxisConstraint,
+            AxisClosestPoint = source.AxisClosestPoint,
+            AxisDirection = source.AxisDirection,
+            AxisRestRadius = source.AxisRestRadius,
+            AxisRadialWeight = source.AxisRadialWeight,
+            AxisTangentialWeight = source.AxisTangentialWeight,
+            AxisNormalWeight = source.AxisNormalWeight
         };
 
         if (clone.UVSum == null)
@@ -1029,6 +1216,8 @@ internal sealed class ArapMeshSimplifier
     {
         var target = vertices[targetIndex];
         var source = vertices[sourceIndex];
+        int targetWeight = Mathf.Max(target?.AggregateWeight ?? 1, 1);
+        int sourceWeight = Mathf.Max(source?.AggregateWeight ?? 1, 1);
         target.Position = newPosition;
         target.RestPosition = mergedRestPosition;
         target.AggregateWeight = combinedWeight;
@@ -1047,6 +1236,64 @@ internal sealed class ArapMeshSimplifier
         target.NormalSum += source.NormalSum;
         target.TangentSum += source.TangentSum;
         target.ColorSum += source.ColorSum;
+
+        if (target.HasAxisConstraint || source.HasAxisConstraint)
+        {
+            float totalAxisWeight = 0f;
+            Vector3 blendedClosest = Vector3.zero;
+            Vector3 blendedAxis = Vector3.zero;
+            float blendedRadial = 0f;
+            float blendedTangential = 0f;
+            float blendedNormal = 0f;
+
+            if (target.HasAxisConstraint)
+            {
+                totalAxisWeight += targetWeight;
+                blendedClosest += target.AxisClosestPoint * targetWeight;
+                blendedAxis += target.AxisDirection * targetWeight;
+                blendedRadial += target.AxisRadialWeight * targetWeight;
+                blendedTangential += target.AxisTangentialWeight * targetWeight;
+                blendedNormal += target.AxisNormalWeight * targetWeight;
+            }
+
+            if (source.HasAxisConstraint)
+            {
+                totalAxisWeight += sourceWeight;
+                blendedClosest += source.AxisClosestPoint * sourceWeight;
+                blendedAxis += source.AxisDirection * sourceWeight;
+                blendedRadial += source.AxisRadialWeight * sourceWeight;
+                blendedTangential += source.AxisTangentialWeight * sourceWeight;
+                blendedNormal += source.AxisNormalWeight * sourceWeight;
+            }
+
+            if (totalAxisWeight > 0f && blendedAxis.sqrMagnitude > AxisConstraintEpsilon * AxisConstraintEpsilon)
+            {
+                blendedClosest /= totalAxisWeight;
+                blendedAxis = SafeNormalize(blendedAxis);
+                float invWeight = 1f / totalAxisWeight;
+                blendedRadial *= invWeight;
+                blendedTangential *= invWeight;
+                blendedNormal *= invWeight;
+
+                Vector3 restDelta = mergedRestPosition - blendedClosest;
+                Vector3 restRadial = restDelta - Vector3.Dot(restDelta, blendedAxis) * blendedAxis;
+                target.HasAxisConstraint = true;
+                target.AxisClosestPoint = blendedClosest;
+                target.AxisDirection = blendedAxis;
+                target.AxisRadialWeight = blendedRadial;
+                target.AxisTangentialWeight = blendedTangential;
+                target.AxisNormalWeight = blendedNormal;
+                target.AxisRestRadius = restRadial.magnitude;
+            }
+            else
+            {
+                ClearAxisConstraint(target);
+            }
+        }
+        else
+        {
+            ClearAxisConstraint(target);
+        }
 
         for (int channel = 0; channel < target.UVSum.Length; channel++)
         {
@@ -1451,6 +1698,9 @@ internal sealed class ArapMeshSimplifier
         float[] initialX = new float[n];
         float[] initialY = new float[n];
         float[] initialZ = new float[n];
+        float[] diagX = new float[n];
+        float[] diagY = new float[n];
+        float[] diagZ = new float[n];
 
         for (int idx = 0; idx < n; idx++)
         {
@@ -1482,6 +1732,9 @@ internal sealed class ArapMeshSimplifier
                 }
             }
             row.Diagonal = Mathf.Max(diag, 1e-8f);
+            diagX[idx] = row.Diagonal;
+            diagY[idx] = row.Diagonal;
+            diagZ[idx] = row.Diagonal;
             rhsX[idx] += rhs[vi].x;
             rhsY[idx] += rhs[vi].y;
             rhsZ[idx] += rhs[vi].z;
@@ -1505,6 +1758,9 @@ internal sealed class ArapMeshSimplifier
                     continue;
                 var anchor = vertices[anchorVertex];
                 rows[rowIndex].Diagonal += anchorWeight;
+                diagX[rowIndex] += anchorWeight;
+                diagY[rowIndex] += anchorWeight;
+                diagZ[rowIndex] += anchorWeight;
                 rhsX[rowIndex] += anchorWeight * anchor.RestPosition.x;
                 rhsY[rowIndex] += anchorWeight * anchor.RestPosition.y;
                 rhsZ[rowIndex] += anchorWeight * anchor.RestPosition.z;
@@ -1514,8 +1770,91 @@ internal sealed class ArapMeshSimplifier
             }
         }
 
+        if (hasAxisConstraints)
+        {
+            for (int idx = 0; idx < n; idx++)
+            {
+                int vi = freeVertices[idx];
+                var vertex = vertices[vi];
+                if (vertex == null || !vertex.HasAxisConstraint)
+                    continue;
+
+                Vector3 axisDir = vertex.AxisDirection;
+                if (axisDir.sqrMagnitude < AxisConstraintEpsilon)
+                    continue;
+
+                float normalWeight = Mathf.Max(0f, vertex.AxisNormalWeight);
+                float tangentialWeight = Mathf.Max(0f, vertex.AxisTangentialWeight);
+                float radialWeight = Mathf.Max(0f, vertex.AxisRadialWeight);
+
+                if (normalWeight > 0f)
+                {
+                    diagX[idx] += normalWeight;
+                    diagY[idx] += normalWeight;
+                    diagZ[idx] += normalWeight;
+                    rhsX[idx] += normalWeight * vertex.RestPosition.x;
+                    rhsY[idx] += normalWeight * vertex.RestPosition.y;
+                    rhsZ[idx] += normalWeight * vertex.RestPosition.z;
+                }
+
+                float axisAdjustment = tangentialWeight - normalWeight;
+                if (Mathf.Abs(axisAdjustment) > AxisConstraintEpsilon)
+                {
+                    float targetAxis = Vector3.Dot(axisDir, vertex.RestPosition);
+                    diagX[idx] += axisAdjustment * axisDir.x * axisDir.x;
+                    diagY[idx] += axisAdjustment * axisDir.y * axisDir.y;
+                    diagZ[idx] += axisAdjustment * axisDir.z * axisDir.z;
+                    rhsX[idx] += axisAdjustment * axisDir.x * targetAxis;
+                    rhsY[idx] += axisAdjustment * axisDir.y * targetAxis;
+                    rhsZ[idx] += axisAdjustment * axisDir.z * targetAxis;
+                }
+
+                if (radialWeight > 0f)
+                {
+                    Vector3 closest = vertex.AxisClosestPoint;
+                    Vector3 current = vertex.Position;
+                    Vector3 delta = current - closest;
+                    float parallel = Vector3.Dot(delta, axisDir);
+                    Vector3 radial = delta - parallel * axisDir;
+                    float radialLength = radial.magnitude;
+                    Vector3 gradRadial = Vector3.zero;
+                    bool validRadial = false;
+                    if (radialLength >= AxisConstraintEpsilon)
+                    {
+                        gradRadial = radial / radialLength;
+                        validRadial = true;
+                    }
+                    else
+                    {
+                        Vector3 restDelta = vertex.RestPosition - closest;
+                        Vector3 restRadial = restDelta - Vector3.Dot(restDelta, axisDir) * axisDir;
+                        float restLength = restRadial.magnitude;
+                        if (restLength >= AxisConstraintEpsilon)
+                        {
+                            gradRadial = restRadial / restLength;
+                            validRadial = true;
+                        }
+                    }
+
+                    if (validRadial)
+                    {
+                        float target = Vector3.Dot(gradRadial, closest) + vertex.AxisRestRadius;
+                        diagX[idx] += radialWeight * gradRadial.x * gradRadial.x;
+                        diagY[idx] += radialWeight * gradRadial.y * gradRadial.y;
+                        diagZ[idx] += radialWeight * gradRadial.z * gradRadial.z;
+                        rhsX[idx] += radialWeight * gradRadial.x * target;
+                        rhsY[idx] += radialWeight * gradRadial.y * target;
+                        rhsZ[idx] += radialWeight * gradRadial.z * target;
+                    }
+                }
+            }
+        }
+
+        SetDiagonal(rows, diagX);
         ConjugateGradient(rows, rhsX, solutionX);
+        SetDiagonal(rows, diagY);
         ConjugateGradient(rows, rhsY, solutionY);
+        SetDiagonal(rows, diagZ);
         ConjugateGradient(rows, rhsZ, solutionZ);
 
         for (int idx = 0; idx < n; idx++)
@@ -1526,6 +1865,16 @@ internal sealed class ArapMeshSimplifier
                 newPos = vertices[vi].RestPosition;
             vertices[vi].Position = newPos;
         }
+    }
+
+    private static void SetDiagonal(LinearSystemRow[] rows, float[] diagonal)
+    {
+        if (rows == null || diagonal == null)
+            return;
+
+        int count = Mathf.Min(rows.Length, diagonal.Length);
+        for (int i = 0; i < count; i++)
+            rows[i].Diagonal = Mathf.Max(diagonal[i], 1e-8f);
     }
 
     private List<int> SelectAnchorVertices(List<int> freeVertices)
