@@ -28,41 +28,43 @@ public static class MeshPolygonReducer
         int totalReducedTriangles = 0;
         int successfulRenderers = 0;
 
-        using var assetEditingScope = new AssetEditingScope();
-        using var progress = new ProgressScope("Reduce Mesh Polygons");
-
-        for (int i = 0; i < targetRenderers.Count; i++)
+        using (var assetEditingScope = new AssetEditingScope())
         {
-            var renderer = targetRenderers[i];
-            progress.Report($"Processing {i + 1}/{targetRenderers.Count}: {renderer.name}", (float)i / targetRenderers.Count);
+            using var progress = new ProgressScope("Reduce Mesh Polygons");
 
-            var originalMesh = renderer.sharedMesh;
-            if (originalMesh == null)
-                continue;
-
-            bool[] vertexMask = null;
-            if (limitBounds.HasValue)
+            for (int i = 0; i < targetRenderers.Count; i++)
             {
-                bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
-                vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache, evaluateInCurrentPose);
+                var renderer = targetRenderers[i];
+                progress.Report($"Processing {i + 1}/{targetRenderers.Count}: {renderer.name}", (float)i / targetRenderers.Count);
+
+                var originalMesh = renderer.sharedMesh;
+                if (originalMesh == null)
+                    continue;
+
+                bool[] vertexMask = null;
+                if (limitBounds.HasValue)
+                {
+                    bool evaluateInCurrentPose = ShouldEvaluateInCurrentPose(renderer);
+                    vertexMask = GetOrCreateMask(renderer, originalMesh, limitBounds.Value, vertexMaskCache, evaluateInCurrentPose);
+                }
+
+                if (!TryReduceRenderer(renderer, reductionRatio, vertexMask, seed, assetEditingScope,
+                                       out int originalTriangleCount, out int reducedTriangleCount, out bool createdAsset))
+                {
+                    continue;
+                }
+
+                assetCreated |= createdAsset;
+                anyRendererModified = true;
+                successfulRenderers++;
+                totalOriginalTriangles += originalTriangleCount;
+                totalReducedTriangles += reducedTriangleCount;
+
+                float percent = ((float)(i + 1) / targetRenderers.Count) * 100f;
+                percent = Mathf.Floor(percent * 1000f) / 1000f;
+                progress.Report($"Processed {i + 1}/{targetRenderers.Count}: {renderer.name} ({percent:F3}%)",
+                                (float)(i + 1) / targetRenderers.Count);
             }
-
-            if (!TryReduceRenderer(renderer, reductionRatio, vertexMask, seed, assetEditingScope,
-                                   out int originalTriangleCount, out int reducedTriangleCount, out bool createdAsset))
-            {
-                continue;
-            }
-
-            assetCreated |= createdAsset;
-            anyRendererModified = true;
-            successfulRenderers++;
-            totalOriginalTriangles += originalTriangleCount;
-            totalReducedTriangles += reducedTriangleCount;
-
-            float percent = ((float)(i + 1) / targetRenderers.Count) * 100f;
-            percent = Mathf.Floor(percent * 1000f) / 1000f;
-            progress.Report($"Processed {i + 1}/{targetRenderers.Count}: {renderer.name} ({percent:F3}%)",
-                            (float)(i + 1) / targetRenderers.Count);
         }
 
         if (assetCreated)
@@ -324,7 +326,7 @@ public static class MeshPolygonReducer
         while (low <= high)
         {
             int target = (low + high) / 2;
-            if (TrySimplify(simplifier, target, out var simplified))
+            if (TrySimplify(simplifier, target, vertexCount, out var simplified))
             {
                 int simplifiedTriangles = CountTotalTriangles(simplified);
                 if (simplifiedTriangles < lowerTriangleBound)
@@ -376,19 +378,20 @@ public static class MeshPolygonReducer
         return fallbackMesh;
     }
 
-    private static bool TrySimplify(ArapMeshSimplifier simplifier, int targetCandidateCount, out Mesh simplified)
+    private static bool TrySimplify(ArapMeshSimplifier simplifier, int targetCandidateCount, int originalVertexCount, out Mesh simplified)
     {
         var result = simplifier.Simplify(targetCandidateCount);
-        if (result.HasValue)
+        if (result.HasValue && result.Value.Mesh != null)
         {
-            if (result.Value.RemovedTriangles && result.Value.Mesh != null)
+            var mesh = result.Value.Mesh;
+            bool removedGeometry = result.Value.RemovedTriangles || mesh.vertexCount < originalVertexCount;
+            if (removedGeometry)
             {
-                simplified = result.Value.Mesh;
+                simplified = mesh;
                 return true;
             }
 
-            if (result.Value.Mesh != null)
-                UnityEngine.Object.DestroyImmediate(result.Value.Mesh);
+            UnityEngine.Object.DestroyImmediate(mesh);
         }
 
         simplified = null;
